@@ -79,25 +79,14 @@ class CodebookWrapperLinear(torch.nn.Module):
         if self.use_exp_for_scale:
             iscale = get_reciprocal(self.scale.exp())
         else:
-            iscale = get_reciprocal(self.scale)
+            iscale = get_reciprocal(self.scale.abs() + 1e-5)
 
         normalized = weight * iscale
         return normalized
 
     @torch.no_grad()
     def update_indexes(self):
-        weight = self.orig_layer.weight.data
-        out_features, in_features = weight.shape
-        weight = weight.view(out_features, in_features // self.group_size, self.group_size).to(self.codebook.device)
-
-        if self.use_exp_for_scale:
-            iscale = get_reciprocal(self.scale.exp())
-        else:
-            iscale = get_reciprocal(self.scale)
-
-        # Normalize weight by scale, find nearest normalized codebook entry
-        # (equivalent to original but consistent with dequantize_weight normalization)
-        normalized = weight * iscale
+        normalized = self.get_normalized_weights()
         codebook_norm = self.codebook / self.codebook.abs().max().clamp(min=1e-8)
         self.indexes = torch.argmin(
             (normalized.unsqueeze(-1) - codebook_norm).abs(), dim=-1
@@ -229,7 +218,7 @@ class CodebookWrapperLinear(torch.nn.Module):
         if self.use_exp_for_scale:
             weight = weight * self.scale.exp()
         else:
-            weight = weight * self.scale
+            weight = weight * (self.scale.abs() + 1e-5)
 
         out_features, in_features = self.orig_layer.weight.shape
         return weight.view(out_features, in_features)

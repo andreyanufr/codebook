@@ -344,6 +344,12 @@ def get_argument_parser() -> argparse.ArgumentParser:
         choices=["mlp", "attention", "both"],
         help="Which sublayers to train in layer-wise mode: 'mlp', 'attention', or 'both'.",
     )
+    parser.add_argument(
+        "--description",
+        type=str,
+        default=None,
+        help="Description of experiment to create directoty for tensorboard and model checkpoint.",
+    )
     return parser
 
 
@@ -361,8 +367,14 @@ def main(argv) -> float:
 
     # Configure output and log files.
     output_dir = Path(args.output_dir)
-    tensorboard_dir = output_dir / "tb" / datetime.now().strftime("%Y-%m-%d__%H-%M-%S")
-    last_dir = output_dir / "last"
+
+    if args.description is not None:
+        tensorboard_dir = output_dir / "tb" / f"{args.description}"
+        last_dir = output_dir / f"{args.description}_last"
+    else:
+        tensorboard_dir = output_dir / "tb" / datetime.now().strftime("%Y-%m-%d__%H-%M-%S")
+        last_dir = output_dir / "last"
+    
     if not args.resume:
         shutil.rmtree(last_dir, ignore_errors=True)
     for path in [output_dir, tensorboard_dir, last_dir]:
@@ -388,7 +400,7 @@ def main(argv) -> float:
     if args.layerwise:
         finetune_layerwise(model, tokenizer, train_loader, lr=args.lr, epochs_per_layer=args.layerwise_epochs, batch_size=args.batch_size, microbatch_size=args.microbatch_size, device=device, tb=tb)
  
-        save_codebook_layers(model, output_dir)
+        save_codebook_layers(model, last_dir)
 
         model = unwrap_model(model)
         model.save_pretrained(last_dir)

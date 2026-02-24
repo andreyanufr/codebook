@@ -307,9 +307,10 @@ def finetune_layer_l2(
         else:
             param.requires_grad = False
     
-    param_to_train.extend(codebooks_to_train) #[{"params": codebooks_to_train, "lr": lr}, {"params": scales_to_train, "lr": 10 * lr}]
-    param_to_train.extend(scales_to_train)
-    
+    # param_to_train.extend(codebooks_to_train) #[{"params": codebooks_to_train, "lr": lr}, {"params": scales_to_train, "lr": 10 * lr}]
+    # param_to_train.extend(scales_to_train) 
+    param_to_train = [{"params": codebooks_to_train, "lr": lr}, {"params": scales_to_train, "lr": 10 * lr}]
+
     if not param_to_train:
         print(f"WARNING: No trainable parameters found in layer {layer_idx}, skipping fine-tuning for this layer.")
         if return_next_layer_inputs:
@@ -332,87 +333,26 @@ def finetune_layer_l2(
     num_samples = len(fp_inputs["hidden_states"])
     epoch_samples = num_samples - num_samples % microbatch_size
     microbatches_per_epoch = epoch_samples // microbatch_size
-    loss_comput = nn.SmoothL1Loss(beta=10.0)
 
-    global_step = 0
+
+    updtable_epochs = 2 #max(int(0.05 * epochs_per_layer), 1)
+    global_step = 0    
+    opt = torch.optim.AdamW(param_to_train, weight_decay=0.0)#, lr=lr)
     
-    soft_epochs = int(percent_of_warmup_soft_epochs * epochs_per_layer)
-    if soft_epochs > 0:
-        for name, sub_layer in layer.named_modules():
-            if isinstance(sub_layer, CodebookWrapperLinear):
-                sub_layer.use_soft_forward = True
+    total_steps = epochs_per_layer * epoch_samples // batch_size
+    warmup_steps = updtable_epochs * epoch_samples // batch_size  # constant-LR phase
 
-        opt = torch.optim.AdamW(param_to_train, weight_decay=0.0, lr=lr)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, eta_min=lr * 1e-4, T_max=soft_epochs * epoch_samples // batch_size)
-        for epoch in range(soft_epochs):
-            opt.zero_grad()  # Clear any stale gradients from prior epoch's incomplete accumulation
-            batch_indices_epoch = torch.randperm(num_samples)[:epoch_samples].chunk(microbatches_per_epoch)
-            epoch_loss = 0.0
-            num_batches = 0
-            loss_numerator = grad_steps = 0
-            loss_denuminator = 0
+    # def lr_lambda(step):
+    #     if step < warmup_steps:
+    #         return 1.0  # constant during index-update phase
+    #     # linear decay over remaining steps
+    #     remaining = total_steps - warmup_steps
+    #     return max(1e-4, 1.0 - (step - warmup_steps) / remaining)
 
-            for indices in track(
-                batch_indices_epoch, 
-                description=f"  Layer {layer_idx}, Epoch {epoch}/{soft_epochs}"
-            ):
-                indices = indices.tolist()
-                
-                # Form batch
-                hidden, kwargs = collate_fn(fp_inputs, indices)
-                hidden = hidden.to(device)
+    # scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
 
-                layer_outputs = layer(hidden, **kwargs)#[0]
-                #orig_output = torch.stack([fp_outputs[i] for i in indices], dim=0).to(device)
-                orig_output = torch.cat([fp_outputs[i] for i in indices], dim=0).to(device)
-                
-                # Compute L2 loss between outputs
-                loss = loss_comput(layer_outputs, orig_output.to(dtype=layer_outputs.dtype))
-                
-                if not torch.isfinite(loss).item():
-                    err = f"Fine-tuning loss is {loss} at layer {layer_idx}"
-                    raise ValueError(err)
-                
-                # Gradient accumulation
-                loss_numerator += loss.item()
-                loss_denuminator += torch.mean(orig_output**2).detach().item()
-                grad_steps += 1
-                
-                (loss / grad_accumulation_steps).backward()
-
-                if grad_steps == grad_accumulation_steps:
-                    torch.nn.utils.clip_grad_norm_(param_to_train, 0.1)
-                        
-                    opt.step()
-                    scheduler.step()
-                    
-                    rel_aggregated_loss = (loss_numerator /  max(loss_denuminator, 1e-8)) #/  grad_steps
-                    aggregated_loss = loss_numerator / grad_steps
-                    epoch_loss += aggregated_loss
-                    num_batches += 1
-                    loss_numerator = loss_denuminator = grad_steps = 0
-                    
-                    if tb is not None:
-                        tb.add_scalar(f"layerwise_relative_soft_loss/layer_{layer_idx}", rel_aggregated_loss, global_step)
-                        tb.add_scalar(f"layerwise_soft_loss/layer_{layer_idx}", aggregated_loss, global_step)
-                        # tb.add_scalar(f"layerwise_lr/layer_{layer_idx}", opt.param_groups[0]["lr"], global_step)
-                        # log_gradients_in_model(layer, tb, global_step, layer_idx)
-                    
-                    opt.zero_grad()
-                    
-                    global_step += 1
-        
-        
-        for name, sub_layer in layer.named_modules():
-            if isinstance(sub_layer, CodebookWrapperLinear):
-                sub_layer.use_soft_forward = False
-                sub_layer.update_indexes()  # Update indexes after soft fine-tuning to prepare for hard fine-tuning
-
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, eta_min=lr * 1e-4, T_max=total_steps)
     
-    opt = torch.optim.AdamW(param_to_train, weight_decay=0.0, lr=lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, eta_min=lr * 1e-4, T_max=epochs_per_layer * epoch_samples // batch_size)
-    
-    updtable_epochs = max(int(0.05 * epochs_per_layer), 1)
 
     for epoch in range(epochs_per_layer):
         opt.zero_grad()  # Clear any stale gradients from prior epoch's incomplete accumulation
@@ -422,10 +362,6 @@ def finetune_layer_l2(
         loss_numerator = grad_steps = 0
         loss_denuminator = 0
 
-        # if epoch < updtable_epochs:
-        #     for name, sub_layer in layer.named_modules():
-        #         if isinstance(sub_layer, CodebookWrapperLinear):
-        #             sub_layer.update_indexes()
 
         for indices in track(
             batch_indices_epoch, 
@@ -440,13 +376,13 @@ def finetune_layer_l2(
             layer_outputs = layer(hidden, **kwargs)#[0]
             #orig_output = torch.stack([fp_outputs[i] for i in indices], dim=0).to(device)
             orig_output = torch.cat([fp_outputs[i] for i in indices], dim=0).to(device)
-            
+
             # Compute L2 loss between outputs
-            loss = F.mse_loss(layer_outputs, orig_output.to(dtype=layer_outputs.dtype))
+            #loss = F.mse_loss(layer_outputs, orig_output.to(dtype=layer_outputs.dtype))
             #loss = loss_comput(layer_outputs, orig_output.to(dtype=layer_outputs.dtype))
             
-            # _, mask = get_abs_top_percent_mask(torch.abs(layer_outputs - orig_output))  # This will update the mask used in the forward pass of CodebookWrapperLinear for the next iteration
-            # loss = torch.mean(((layer_outputs - orig_output.to(dtype=layer_outputs.dtype)) * mask)**2)
+            _, mask = get_abs_top_percent_mask(torch.abs(layer_outputs - orig_output))  # This will update the mask used in the forward pass of CodebookWrapperLinear for the next iteration
+            loss = torch.mean(((layer_outputs - orig_output.to(dtype=layer_outputs.dtype)) * mask)**2)
             
             if not torch.isfinite(loss).item():
                 err = f"Fine-tuning loss is {loss} at layer {layer_idx}"
@@ -460,10 +396,20 @@ def finetune_layer_l2(
             (loss / grad_accumulation_steps).backward()
 
             if grad_steps == grad_accumulation_steps:
-                torch.nn.utils.clip_grad_norm_(param_to_train, 0.1)
+                if isinstance(param_to_train[0], dict):
+                    for group in param_to_train:
+                        torch.nn.utils.clip_grad_norm_(group["params"], 1.0)
+                else:
+                    torch.nn.utils.clip_grad_norm_(param_to_train, 1.0)
                     
                 opt.step()
                 scheduler.step()
+                
+                
+                if epoch < updtable_epochs:
+                    for name, sub_layer in layer.named_modules():
+                        if isinstance(sub_layer, CodebookWrapperLinear):
+                            sub_layer.update_indexes()
                 
                 rel_aggregated_loss = (loss_numerator /  max(loss_denuminator, 1e-8)) #/  grad_steps
                 aggregated_loss = loss_numerator / grad_steps
