@@ -70,6 +70,7 @@ from nncf.common.logging.track_progress import track
 
 from codebook_wrapper import wrap_model, unwrap_model
 from layerwise_tuning import finetune_layerwise
+from layerwise_ste_tuning import finetune_layerwise_ste
 
 
 def save_codebook_layers(model: nn.Module, output_dir: Path):
@@ -115,7 +116,7 @@ def get_compression_calibration(num_samples: int, seqlen: int, tokenizer: Any, d
 
     ds = load_dataset("neuralmagic/LLM_compression_calibration", split="train")
     #ds = ds.shuffle(seed=42).select(range(10 * num_samples))
-    ds = ds.map(preprocess_fn)
+    #ds = ds.map(preprocess_fn)
     
     trainloader = []
     for example in ds:
@@ -394,12 +395,17 @@ def main(argv) -> float:
     train_loader = get_pile(
         num_samples=args.num_train_samples, seqlen=args.train_seqlen, tokenizer=tokenizer, device=device
     )
+    
+    # train_loader = get_compression_calibration(
+    #     num_samples=args.num_train_samples, seqlen=args.train_seqlen, tokenizer=tokenizer, device=device
+    # )
 
     #model = wrap_model(model)
     
     if args.layerwise:
-        finetune_layerwise(model, tokenizer, train_loader, lr=args.lr, epochs_per_layer=args.layerwise_epochs, batch_size=args.batch_size, microbatch_size=args.microbatch_size, device=device, tb=tb)
- 
+        #finetune_layerwise(model, tokenizer, train_loader, lr=args.lr, epochs_per_layer=args.layerwise_epochs, batch_size=args.batch_size, microbatch_size=args.microbatch_size, device=device, tb=tb)
+
+        finetune_layerwise_ste(model, tokenizer, train_loader, lr=args.lr, epochs_per_layer=args.layerwise_epochs, batch_size=args.batch_size, microbatch_size=args.microbatch_size, device=device, tb=tb, lora_rank=64, group_size=64)  
         save_codebook_layers(model, last_dir)
 
         model = unwrap_model(model)
