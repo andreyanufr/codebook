@@ -177,12 +177,13 @@ def finetune_layerwise(
                         batch_input[key] = fp_inputs[key]
 
                 output = layer(**batch_input)
-                fp_outputs.append(output.detach())
+                fp_outputs.append(output.detach().cpu())
         
         if layer_idx in ignored_layers:
-            model.model.layers[layer_idx].to('cpu')#= layer.to('cpu')
+            model.model.layers[layer_idx].to('cpu')
             del fp_inputs["hidden_states"]
             fp_inputs["hidden_states"] = fp_outputs
+            del fp_outputs
             cleanup()  # Clear cache after each layer
             continue
 
@@ -207,9 +208,14 @@ def finetune_layerwise(
             tb=tb,
             return_next_layer_inputs=True
         )
+        # Move q_inputs to CPU to prevent GPU memory accumulation
+        q_inputs = [t.detach().cpu() if t.is_cuda else t for t in q_inputs]
+
         model.model.layers[layer_idx] = layer.to('cpu')  # Move back to CPU after fine-tuning this layer
+        del layer
         del fp_inputs["hidden_states"]
         fp_inputs["hidden_states"] = fp_outputs
+        del fp_outputs
         cleanup()  # Clear cache after each layer
 
     # Restore accelerate dispatch hooks on all modules that had them
@@ -218,8 +224,8 @@ def finetune_layerwise(
         module.forward = fwd
 
 
-def collate_fn(data, indexes):
-    hidden_states = torch.cat([data["hidden_states"][i] for i in indexes], dim=0)
+def collate_fn(data, indexes, device):
+    hidden_states = torch.cat([data["hidden_states"][i] for i in indexes], dim=0).to(device)
 
     kwargs = {}
     for key in data:
@@ -228,9 +234,9 @@ def collate_fn(data, indexes):
             # Move tensor tuples (e.g. position_embeddings) and tensors to the
             # same device as hidden_states to avoid cross-device errors.
             if isinstance(val, (tuple, list)) and all(isinstance(v, Tensor) for v in val):
-                val = type(val)(v.to(hidden_states.device) for v in val)
+                val = type(val)(v.to(device) for v in val)
             elif isinstance(val, Tensor):
-                val = val.to(hidden_states.device)
+                val = val.to(device)
             kwargs[key] = val
     return hidden_states, kwargs
 
@@ -318,8 +324,8 @@ def finetune_layer_l2(
             next_inputs = []
             with torch.no_grad():
                 for i in range(num_samples):
-                    hidden, kwargs = collate_fn(fp_inputs, [i])
-                    next_inputs.append(layer(hidden.to(device), **kwargs))
+                    hidden, kwargs = collate_fn(fp_inputs, [i], device=device)
+                    next_inputs.append(layer(hidden, **kwargs))
             return layer, next_inputs
         return layer
 
@@ -370,8 +376,7 @@ def finetune_layer_l2(
             indices = indices.tolist()
             
             # Form batch
-            hidden, kwargs = collate_fn(fp_inputs, indices)
-            hidden = hidden.to(device)
+            hidden, kwargs = collate_fn(fp_inputs, indices, device=device)
 
             layer_outputs = layer(hidden, **kwargs)#[0]
             #orig_output = torch.stack([fp_outputs[i] for i in indices], dim=0).to(device)
@@ -394,6 +399,8 @@ def finetune_layer_l2(
             grad_steps += 1
             
             (loss / grad_accumulation_steps).backward()
+
+            del hidden, layer_outputs, orig_output, loss, mask
 
             if grad_steps == grad_accumulation_steps:
                 if isinstance(param_to_train[0], dict):
@@ -443,9 +450,10 @@ def finetune_layer_l2(
         next_inputs = []
         with torch.no_grad():
             for i in range(num_samples):
-                hidden, kwargs = collate_fn(fp_inputs, [i])
-                next_input = layer(hidden, **kwargs)#.cpu()
-                next_inputs.append(next_input)
+                hidden, kwargs = collate_fn(fp_inputs, [i], device=device)
+                out = layer(hidden, **kwargs)
+                next_inputs.append(out.detach().cpu())
+                del out
         return layer, next_inputs
 
     return layer

@@ -48,12 +48,12 @@ def _one_hot_uint8_full_kernel(
     dimension in CLASS_BLOCK-sized tiles and writes 0/1 directly.
     """
     pid = tl.program_id(0)
-    row_ids = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)       # [BLOCK_SIZE]
+    row_ids = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)       # [BLOCK_SIZE] - offset + range
     row_mask = row_ids < N
 
-    idx = tl.load(indices_ptr + row_ids, mask=row_mask, other=0).to(tl.int32)  # [BLOCK_SIZE]
+    idx = tl.load(indices_ptr + row_ids, mask=row_mask, other=0).to(tl.int32)  # [BLOCK_SIZE] - block wof class indices for this block of rows
 
-    for class_start in tl.static_range(0, num_classes, CLASS_BLOCK):
+    for class_start in tl.static_range(0, num_classes, CLASS_BLOCK): # one iteration ?
         col_ids = class_start + tl.arange(0, CLASS_BLOCK)       # [CLASS_BLOCK]
         col_mask = col_ids < num_classes
 
@@ -63,6 +63,39 @@ def _one_hot_uint8_full_kernel(
 
         full_mask = row_mask[:, None] & col_mask[None, :]
         tl.store(output_ptr + out_offsets, values, mask=full_mask)
+
+
+@triton.jit
+def _one_hot_uint8_full_kernel_flat(
+    indices_ptr,   # [N] uint8 input indices
+    output_ptr,    # [N, num_classes] output (written in full, no pre-zero needed)
+    num_classes: tl.constexpr,
+    N,
+    BLOCK_SIZE: tl.constexpr,
+    CLASS_BLOCK: tl.constexpr,
+):
+    """
+    Write entire one-hot rows without needing a pre-zeroed buffer.
+
+    Each program handles BLOCK_SIZE rows; it iterates over the class
+    dimension in CLASS_BLOCK-sized tiles and writes 0/1 directly.
+    """
+    pid = tl.program_id(0)
+    row_ids = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)       # [BLOCK_SIZE] - offset + range
+    row_mask = row_ids < N
+
+    idx = tl.load(indices_ptr + row_ids, mask=row_mask, other=0).to(tl.int32)  # [BLOCK_SIZE] - block wof class indices for this block of rows
+
+    for class_start in tl.static_range(0, num_classes, CLASS_BLOCK): # one iteration ?
+        col_ids = class_start + tl.arange(0, CLASS_BLOCK)       # [CLASS_BLOCK]
+        col_mask = col_ids < num_classes
+
+        # 2-D offsets: [BLOCK_SIZE, CLASS_BLOCK]
+        #out_offsets = row_ids[:, None] * num_classes + col_ids[None, :]
+        values = (idx[:, None] == col_ids[None, :]).to(output_ptr.dtype.element_ty)
+
+        full_mask = row_mask[:, None] & col_mask[None, :]
+        tl.store(output_ptr + pid * BLOCK_SIZE * num_classes, values, mask=full_mask)
 
 
 def one_hot(

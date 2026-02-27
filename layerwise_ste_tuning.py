@@ -26,6 +26,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from pathlib import Path
 from rich.progress import track
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
@@ -36,9 +38,12 @@ from layerwise_tuning import (
     collate_fn,
     get_first_block_inputs,
     log_gradients_in_model,
+    get_abs_top_percent_mask
 )
 
+
 from one_hot_uint8 import one_hot as one_hot_uint8_impl
+from pack_unpack import pack_4bit, pack_2bit
 
 # ---------------------------------------------------------------------------
 # CodebookLoRASTELinear – linear layer with codebook quant + STE + LoRA
@@ -138,7 +143,7 @@ class CodebookLoRASTELinear(nn.Module):
         self._mse_init()
 
         # Save VRAM – move original weight to CPU (pulled back during STE fwd)
-        self.orig_layer.to("cpu")
+        #self.orig_layer.to("cpu")
 
     # ------------------------------------------------------------------
     # Initialisation helpers
@@ -172,6 +177,12 @@ class CodebookLoRASTELinear(nn.Module):
         If LoRA parameters have not been created yet (during __init__),
         returns just the original weight.
         """
+
+        if not hasattr(self, "lora_B"):
+            return self.orig_layer.weight.data.detach()
+
+        return self.orig_layer.weight + (self.lora_B @ self.lora_A) * (self.lora_alpha / self.lora_rank)
+
         weight = self.orig_layer.weight.data.to(self.codebook.device)
         if hasattr(self, "lora_B") and hasattr(self, "lora_A"):
             lora_delta = (self.lora_B @ self.lora_A) * (self.lora_alpha / self.lora_rank)
@@ -423,6 +434,43 @@ class CodebookLoRASTELinear(nn.Module):
     def dequantize(self):
         """Return the dequantized weight (codebook only, after LoRA has been merged)."""
         return self._dequantize_hard()
+    
+    @torch.no_grad()
+    def get_compressed_indexes(self):
+        if self.n_bits == 2:
+            packed = pack_2bit(self.indexes)
+        elif self.n_bits == 4:
+            packed = pack_4bit(self.indexes)
+        else:
+            raise ValueError("Unsupported n_bits for packing indexes")
+        return packed
+
+
+    @torch.no_grad()
+    def get_state_dict(self):
+        """Return a state dict containing just the codebook, scale, and indexes."""
+        return {
+            "codebook": self.codebook.data.cpu(),
+            "scale": self.scale.data.cpu(),
+            "shape": self.orig_layer.weight.shape,
+            "indexes": self.get_compressed_indexes().cpu(),
+        }
+
+
+def save_codebook_layers(model: nn.Module, output_dir: Path):
+    """
+    Saves the codebook layers of the model to the specified output directory.
+
+    :param model: The model containing the codebook layers to be saved.
+    :param output_dir: The directory where the codebook layers will be saved.
+    """
+    codebook_state_dict = {}
+    for name, module in model.named_modules():
+        if isinstance(module, CodebookLoRASTELinear):
+            codebook_state_dict[name] = module.get_state_dict()
+
+    torch.save(codebook_state_dict, output_dir / "codebook_layers.pth")
+    print(f"Codebook layers saved to {output_dir / 'codebook_layers.pth'}")
 
 
 # ---------------------------------------------------------------------------
@@ -459,7 +507,7 @@ def wrap_model_block_ste(
                 changed_modules[name] = module
 
     for name, module in changed_modules.items():
-        print(f"  Wrapping {name} with CodebookLoRASTELinear 2bit (rank={lora_rank})")
+        print(f"  Wrapping {name} with CodebookLoRASTELinear 2bit (rank={lora_rank}, group_size={group_size})")
         set_module(
             block,
             name,
@@ -471,10 +519,10 @@ def wrap_model_block_ste(
                 group_size=group_size,
             ),
         )
-    
+    cleanup()
     
     for name, module in changed_modules_4_bit.items():
-        print(f"  Wrapping {name} with CodebookLoRASTELinear 4bit (rank={lora_rank})")
+        print(f"  Wrapping {name} with CodebookLoRASTELinear 4bit (rank={lora_rank}, group_size={2 * group_size})")
         set_module(
             block,
             name,
@@ -486,6 +534,7 @@ def wrap_model_block_ste(
                 group_size=2 * group_size,
             ),
         )
+    cleanup()
         
     return block
 
@@ -534,6 +583,7 @@ def finetune_layer_ste(
     ste_temp_start: float = 1.0,
     ste_temp_end: float = 0.01,
     index_update_epochs: int = 4,
+    keep_data_on_cpu: bool = True,
 ) -> nn.Module:
     """Fine-tune a single transformer block using STE + LoRA with L2 loss.
 
@@ -563,6 +613,9 @@ def finetune_layer_ste(
     codebooks: list[nn.Parameter] = []
     scales: list[nn.Parameter] = []
     lora_params: list[nn.Parameter] = []
+    
+    
+    layer = torch.compile(layer)
 
     for name, param in layer.named_parameters():
         if "codebook" in name:
@@ -580,6 +633,7 @@ def finetune_layer_ste(
     param_groups = [
         {"params": codebooks, "lr": lr, "label": "codebook"},
         {"params": scales, "lr": 10 * lr, "label": "scale"},
+        #{"params": lora_params, "lr": lora_lr, "label": "lora"},
         {"params": lora_params, "lr": 0.1 * lora_lr, "label": "lora"},
     ]
     # Drop empty groups
@@ -592,8 +646,10 @@ def finetune_layer_ste(
             next_inputs = []
             with torch.no_grad():
                 for i in range(num_samples):
-                    hidden, kwargs = collate_fn(fp_inputs, [i])
-                    next_inputs.append(layer(hidden.to(device), **kwargs))
+                    hidden, kwargs = collate_fn(fp_inputs, [i], device=device)
+                    out = layer(hidden, **kwargs)
+                    next_inputs.append(out.detach().cpu() if keep_data_on_cpu else out)
+                    del out
             return layer, next_inputs
         return layer
 
@@ -615,7 +671,7 @@ def finetune_layer_ste(
     microbatches_per_epoch = epoch_samples // microbatch_size
     total_opt_steps = epochs_per_layer * epoch_samples // batch_size
 
-    opt = torch.optim.AdamW(param_groups, weight_decay=0.0)
+    opt = torch.optim.AdamW(param_groups, weight_decay=0.01)
 
     # LR schedule: constant during index-update phase, then linear decay
     warmup_steps = index_update_epochs * epoch_samples // batch_size
@@ -628,7 +684,9 @@ def finetune_layer_ste(
             return 1.0
         return max(1e-4, 1.0 - (step - warmup_steps) / remaining)
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
+    #scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
+    
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, eta_min=lr * 1e-4, T_max=total_opt_steps)
 
     # ------------------------------------------------------------------
     # Training loop
@@ -642,6 +700,8 @@ def finetune_layer_ste(
         num_batches = 0
         loss_numerator = grad_steps = 0
         loss_denominator = 0.0
+        max_norm = 0.98**epoch
+        
 
         # Anneal STE temperature
         progress = epoch / max(epochs_per_layer - 1, 1)
@@ -655,13 +715,16 @@ def finetune_layer_ste(
         ):
             indices = indices.tolist()
 
-            hidden, kwargs = collate_fn(fp_inputs, indices)
+            hidden, kwargs = collate_fn(fp_inputs, indices, device=device)
             hidden = hidden.to(device)
 
             layer_outputs = layer(hidden, **kwargs)
             orig_output = torch.cat([fp_outputs[i] for i in indices], dim=0).to(device)
 
-            loss = F.mse_loss(layer_outputs, orig_output.to(dtype=layer_outputs.dtype))
+            #loss = F.mse_loss(layer_outputs, orig_output.to(dtype=layer_outputs.dtype))
+
+            _, mask = get_abs_top_percent_mask(torch.abs(layer_outputs - orig_output))  # This will update the mask used in the forward pass of CodebookWrapperLinear for the next iteration
+            loss = torch.mean(((layer_outputs - orig_output.to(dtype=layer_outputs.dtype)) * mask)**2)
 
             if not torch.isfinite(loss).item():
                 raise ValueError(
@@ -674,9 +737,11 @@ def finetune_layer_ste(
 
             (loss / grad_accumulation_steps).backward()
 
+            del hidden, layer_outputs, orig_output, loss
+
             if grad_steps == grad_accumulation_steps:
                 for group in param_groups:
-                    torch.nn.utils.clip_grad_norm_(group["params"], 1.0)
+                    torch.nn.utils.clip_grad_norm_(group["params"], max_norm)
 
                 opt.step()
                 scheduler.step()
@@ -702,6 +767,7 @@ def finetune_layer_ste(
                 opt.zero_grad()
                 global_step += 1
 
+        cleanup()
         avg_epoch_loss = epoch_loss / max(num_batches, 1)
         print(f"    Epoch {epoch}: avg loss = {avg_epoch_loss:.6f}")
 
@@ -711,24 +777,40 @@ def finetune_layer_ste(
     print(f"  Merging LoRA into codebook representation ...")
     for m in ste_modules:
         m.training_mode_ste = False
-        
-        m.check_hard_and_ste_consistency()
-        
+        #m.check_hard_and_ste_consistency()
         m.merge_lora()
 
     del opt, scheduler
     cleanup()
+    
+    if hasattr(layer, "_orig_mod"):
+        layer = layer._orig_mod
 
     print(f"\n{'='*80}")
     print(f"STE+LoRA fine-tuning complete for layer {layer_idx}!")
     print(f"{'='*80}\n")
 
+    # Move orig_layers back to CPU to free GPU memory before computing next_inputs
+    for m in ste_modules:
+        m.orig_layer.to("cpu")
+    cleanup()
+
     if return_next_layer_inputs:
+        # Temporarily move orig_layers to device for the forward pass
+        for m in ste_modules:
+            m.orig_layer.to(device)
+
         next_inputs = []
         with torch.no_grad():
             for i in range(num_samples):
-                hidden, kwargs = collate_fn(fp_inputs, [i])
-                next_inputs.append(layer(hidden.to(device), **kwargs))
+                hidden, kwargs = collate_fn(fp_inputs, [i], device=device)
+                out = layer(hidden.to(device), **kwargs)
+                next_inputs.append(out.detach().cpu() if keep_data_on_cpu else out)
+                del out
+
+        for m in ste_modules:
+            m.orig_layer.to("cpu")
+
         return layer, next_inputs
 
     return layer
@@ -756,6 +838,8 @@ def finetune_layerwise_ste(
     ste_temp_end: float = 0.01,
     index_update_epochs: int = 4,
     group_size: int = 32,
+    keep_data_on_cpu: bool = True,
+    codebook_dst_dir: Optional[Path] = None,
 ) -> nn.Module:
     """Layer-wise fine-tuning using STE codebook quantisation + LoRA.
 
@@ -783,6 +867,17 @@ def finetune_layerwise_ste(
     ignored_layers : list[int] or None
         Layer indices to skip (supports negative indexing).
         Defaults to ``[0, 1, 2, 3, -1, -2, -3, -4]``.
+    ste_temp_start / ste_temp_end : float
+        STE softmax temperature annealed linearly from start → end over epochs.
+    index_update_epochs : int
+        Number of initial epochs during which indexes are refreshed after every
+        optimiser step.
+    group_size : int
+        Number of weight elements per scale group in the quantisation scheme.
+    keep_data_on_cpu : bool
+        If True, keep intermediate activations on CPU to reduce GPU memory usage.
+    codebook_dst_dir : Path or None
+        If not None, directory to save the codebook and scale parameters for each layer after training (one with dict "codebook.pt").
     """
     if ignored_layers is None:
         ignored_layers = [] #[0, 1, 2, 3, -1, -2, -3, -4]
@@ -793,6 +888,10 @@ def finetune_layerwise_ste(
 
     # Cache first-block inputs via a single FP forward pass
     inputs = get_first_block_inputs(model, dataset=train_loader)
+
+    if keep_data_on_cpu:
+        inputs["hidden_states"] = [x.to("cpu") for x in inputs["hidden_states"]]
+
     model.to("cpu")
     torch.cuda.empty_cache()
 
@@ -825,7 +924,7 @@ def finetune_layerwise_ste(
 
         layer = model.model.layers[layer_idx].to(device)
 
-        # Compute FP reference outputs
+        # Compute FP reference outputs (store on CPU to avoid GPU accumulation)
         with torch.no_grad():
             for i in range(len(fp_inputs["hidden_states"])):
                 batch_input = {"hidden_states": fp_inputs["hidden_states"][i].to(device)}
@@ -833,7 +932,7 @@ def finetune_layerwise_ste(
                     if key != "hidden_states":
                         batch_input[key] = fp_inputs[key]
                 output = layer(**batch_input)
-                fp_outputs.append(output.detach())
+                fp_outputs.append(output.detach().cpu())
 
         # --- Ignored (FP-passthrough) layers ---
         if layer_idx in ignored_set:
@@ -848,11 +947,13 @@ def finetune_layerwise_ste(
                         for key in fp_inputs:
                             if key != "hidden_states":
                                 qi[key] = fp_inputs[key]
-                        new_q.append(layer_dev(**qi).detach())
+                        new_q.append(layer_dev(**qi).detach().cpu())
                 model.model.layers[layer_idx].to("cpu")
+                del q_inputs
                 q_inputs = new_q
             del fp_inputs["hidden_states"]
             fp_inputs["hidden_states"] = fp_outputs
+            del fp_outputs
             cleanup()
             continue
 
@@ -891,11 +992,16 @@ def finetune_layerwise_ste(
             ste_temp_start=ste_temp_start,
             ste_temp_end=ste_temp_end,
             index_update_epochs=index_update_epochs,
+            keep_data_on_cpu=keep_data_on_cpu,
         )
+
+        # Move q_inputs to CPU to prevent GPU memory accumulation
+        q_inputs = [t.detach().cpu() if t.is_cuda else t for t in q_inputs]
 
         model.model.layers[layer_idx] = layer.to("cpu")
         del fp_inputs["hidden_states"]
         fp_inputs["hidden_states"] = fp_outputs
+        del fp_outputs
         cleanup()
 
     # Restore accelerate dispatch hooks
@@ -903,6 +1009,10 @@ def finetune_layerwise_ste(
         module._old_forward = module.forward
         module.forward = fwd
 
+    if codebook_dst_dir is not None:
+        save_codebook_layers(model, codebook_dst_dir)
+
+    torch.compiler.reset()
     model = unwrap_model_ste(model)
 
     return model

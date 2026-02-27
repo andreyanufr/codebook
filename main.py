@@ -351,6 +351,12 @@ def get_argument_parser() -> argparse.ArgumentParser:
         default=None,
         help="Description of experiment to create directoty for tensorboard and model checkpoint.",
     )
+    parser.add_argument(
+        "--keep_data_on_cpu",
+        action="store_true",
+        help="Whether to keep the data on CPU during training. This can be useful for large datasets that do not fit in GPU memory.",
+    )
+
     return parser
 
 
@@ -405,8 +411,15 @@ def main(argv) -> float:
     if args.layerwise:
         #finetune_layerwise(model, tokenizer, train_loader, lr=args.lr, epochs_per_layer=args.layerwise_epochs, batch_size=args.batch_size, microbatch_size=args.microbatch_size, device=device, tb=tb)
 
-        finetune_layerwise_ste(model, tokenizer, train_loader, lr=args.lr, epochs_per_layer=args.layerwise_epochs, batch_size=args.batch_size, microbatch_size=args.microbatch_size, device=device, tb=tb, lora_rank=64, group_size=64)  
-        save_codebook_layers(model, last_dir)
+        finetune_layerwise_ste(model, tokenizer, train_loader, lr=args.lr,
+                               epochs_per_layer=args.layerwise_epochs,
+                               batch_size=args.batch_size,
+                               microbatch_size=args.microbatch_size,
+                               device=device, tb=tb, 
+                               lora_rank=256, group_size=64,
+                               codebook_dst_dir=last_dir,
+                               keep_data_on_cpu=args.keep_data_on_cpu)
+        #save_codebook_layers(model, last_dir)
 
         model = unwrap_model(model)
         model.save_pretrained(last_dir)
