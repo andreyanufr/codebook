@@ -125,7 +125,7 @@ class CodebookLoRASTELinear(nn.Module):
         self.indexes: torch.Tensor = torch.empty(0, dtype=torch.uint8)
         self._init_indexes_and_scale()
 
-        # ---- LoRA adapters (initialised so delta_W = 0) ----
+        # ---- LoRA adapters (placeholder – will be overwritten by SVD init) ----
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
         self.lora_A = nn.Parameter(
@@ -140,10 +140,13 @@ class CodebookLoRASTELinear(nn.Module):
         self.orig_layer.weight.requires_grad = False
 
         # Weight-space MSE init for codebook + scale
-        self._mse_init()
+        #self._mse_init()
+
+        # ---- Initialise LoRA from SVD of quantization error ----
+        #self._svd_lora_init()
 
         # Save VRAM – move original weight to CPU (pulled back during STE fwd)
-        #self.orig_layer.to("cpu")
+        self.orig_layer.to("cpu")
 
     # ------------------------------------------------------------------
     # Initialisation helpers
@@ -181,7 +184,7 @@ class CodebookLoRASTELinear(nn.Module):
         if not hasattr(self, "lora_B"):
             return self.orig_layer.weight.data.detach()
 
-        return self.orig_layer.weight + (self.lora_B @ self.lora_A) * (self.lora_alpha / self.lora_rank)
+        return self.orig_layer.weight.data.to(self.codebook.device) + (self.lora_B @ self.lora_A) * (self.lora_alpha / self.lora_rank)
 
         weight = self.orig_layer.weight.data.to(self.codebook.device)
         if hasattr(self, "lora_B") and hasattr(self, "lora_A"):
@@ -223,6 +226,23 @@ class CodebookLoRASTELinear(nn.Module):
     # ------------------------------------------------------------------
     # Weight-space MSE initialization (same strategy as CodebookWrapperLinear)
     # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def check_nans(self):
+        if torch.isnan(self.codebook).any():
+            raise ValueError("NaNs detected in codebook")
+        if torch.isnan(self.scale).any():
+            raise ValueError("NaNs detected in scale")
+        if torch.isnan(self.indexes.float()).any():
+            raise ValueError("NaNs detected in indexes")
+        
+        if not torch.isfinite(self.codebook).all():
+            raise ValueError("Non-finite values detected in codebook")
+        if not torch.isfinite(self.scale).all():
+            raise ValueError("Non-finite values detected in scale")
+        if not torch.isfinite(self.indexes.float()).all():
+            raise ValueError("Non-finite values detected in indexes")
+
 
     def _mse_init(self, n_iters: int = 200, lr: float = 0.01, index_update_interval: int = 25):
         device = self.codebook.device
@@ -289,6 +309,48 @@ class CodebookLoRASTELinear(nn.Module):
         return best_loss
 
     # ------------------------------------------------------------------
+    # SVD-based LoRA initialisation from quantization error
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _svd_lora_init(self):
+        """Initialise LoRA A/B from a rank-r SVD of the quantization error.
+
+        After ``_mse_init`` has optimised codebook/scale/indexes, compute the
+        residual ``E = W_orig - W_quantized`` and factorise it as
+        ``U @ diag(S) @ V^T``.  Then set::
+
+            lora_B = U_r @ diag(sqrt(S_r)) * sqrt(rank / alpha)
+            lora_A = diag(sqrt(S_r)) @ V_r^T * sqrt(rank / alpha)
+
+        so that ``B @ A * (alpha / rank) ≈ E`` (best rank-r approximation).
+        This gives the optimiser a head start: LoRA already compensates for
+        most of the quantization error from the very first training step.
+        """
+        device = self.codebook.device
+        self.orig_layer.to(device)
+        orig_weight = self.orig_layer.weight.data.to(device)
+
+        # Current hard-quantized weight (no LoRA contribution)
+        quant_weight = self._dequantize_hard()
+
+        error = 0.01 * (orig_weight - quant_weight)  # (out, in)
+
+        # Truncated SVD — compute in float32 for numerical stability
+        U, S, Vh = torch.linalg.svd(error.float(), full_matrices=False)
+
+        r = self.lora_rank
+        # sqrt(S_r) split between A and B
+        sqrt_S = S[:r].sqrt()
+        # Scale factor so that B @ A * (alpha / rank) = U_r S_r V_r^T
+        inv_scale = (self.lora_rank / self.lora_alpha) ** 0.5
+
+        self.lora_B.data = (U[:, :r] * sqrt_S.unsqueeze(0) * inv_scale).to(self.lora_B.dtype)
+        self.lora_A.data = (sqrt_S.unsqueeze(1) * Vh[:r, :] * inv_scale).to(self.lora_A.dtype)
+
+        self.orig_layer.to("cpu")
+
+    # ------------------------------------------------------------------
     # Dequantisation variants
     # ------------------------------------------------------------------
 
@@ -299,9 +361,10 @@ class CodebookLoRASTELinear(nn.Module):
         #     self.indexes.long(), num_classes=2 ** self.n_bits
         # ).to(self.codebook.device, self.codebook.dtype)
         
-        one_hot = one_hot_uint8_impl(
-            self.indexes, num_classes=2 ** self.n_bits, dtype=self.codebook.dtype
-        ).to(self.codebook.device)
+        with torch.cuda.device(codebook.device):
+            one_hot = one_hot_uint8_impl(
+                self.indexes, num_classes=2 ** self.n_bits, dtype=self.codebook.dtype
+            ).to(self.codebook.device)
         
         weight = (codebook * one_hot).sum(dim=-1)
 
@@ -351,9 +414,10 @@ class CodebookLoRASTELinear(nn.Module):
         #     self.indexes.long(), num_classes=2 ** self.n_bits
         # ).to(self.codebook.device, self.codebook.dtype)
         
-        hard_assignment = one_hot_uint8_impl(
-            self.indexes, num_classes=2 ** self.n_bits, dtype=self.codebook.dtype
-        ).to(self.codebook.device)
+        with torch.cuda.device(codebook.device):
+            hard_assignment = one_hot_uint8_impl(
+                self.indexes, num_classes=2 ** self.n_bits, dtype=self.codebook.dtype
+            ).to(self.codebook.device)
 
         # STE trick: forward value = hard, backward gradient = soft
         assignment = hard_assignment + (soft_assignment - soft_assignment.detach())
@@ -556,6 +620,20 @@ def unwrap_model_block_ste(block: nn.Module) -> nn.Module:
     return block
 
 
+def wrap_model_ste(model: nn.Module,
+                n_bits: int = 2,
+                lora_rank: int = 32,
+                group_size: int = 32,
+                lora_alpha: float = 32.0,) -> nn.Module:
+    """Wrap all ``nn.Linear`` layers in the full model with
+    ``CodebookLoRASTELinear``."""
+    for i, layer in enumerate(model.model.layers):
+        model.model.layers[i] = wrap_model_block_ste(layer, layer_index=i, n_layers=len(model.model.layers),
+                                                     n_bits=n_bits, lora_rank=lora_rank,
+                                                     group_size=group_size, lora_alpha=lora_alpha)
+    return model
+
+
 def unwrap_model_ste(model: nn.Module) -> nn.Module:
     """Unwrap all ``CodebookLoRASTELinear`` layers in the full model."""
     for i, layer in enumerate(model.model.layers):
@@ -700,7 +778,7 @@ def finetune_layer_ste(
         num_batches = 0
         loss_numerator = grad_steps = 0
         loss_denominator = 0.0
-        max_norm = 0.98**epoch
+        max_norm = 1.0 #0.98**epoch
         
 
         # Anneal STE temperature
