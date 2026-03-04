@@ -675,7 +675,7 @@ def finetune_layer_ste(
     ste_temp_end: float = 0.01,
     index_update_epochs: int = 4,
     keep_data_on_cpu: bool = True,
-    warm_up_for_scale_and_lora: bool = False,
+    warm_up_codebook_epochs: int = 2,
 ) -> nn.Module:
     """Fine-tune a single transformer block using STE + LoRA with L2 loss.
 
@@ -723,9 +723,8 @@ def finetune_layer_ste(
             param.requires_grad = False
 
     param_groups = [
-        {"params": codebooks, "lr": lr, "label": "codebook"},
+        #{"params": codebooks, "lr": lr, "label": "codebook"},
         {"params": scales, "lr": 10 * lr, "label": "scale"},
-        #{"params": lora_params, "lr": lora_lr, "label": "lora"},
         {"params": lora_params, "lr": 0.1 * lora_lr, "label": "lora"},
     ]
     # Drop empty groups
@@ -760,18 +759,18 @@ def finetune_layer_ste(
     microbatches_per_epoch = epoch_samples // microbatch_size
     total_opt_steps = epochs_per_layer * epoch_samples // batch_size
 
-    if warm_up_for_scale_and_lora:
-        wup_epochs = 2
-        total_wup_opt_steps = wup_epochs * epoch_samples // batch_size
+    if warm_up_codebook_epochs > 0:
+        total_wup_opt_steps = warm_up_codebook_epochs * epoch_samples // batch_size
         
-        print(f"  Warming up scale and LoRA parameters for 1 epoch with STE temperature {ste_temp_start}...")
+        print(f"  Warming up codebook parameters for {warm_up_codebook_epochs} epoch(s) with STE temperature {ste_temp_start}...")
         opt_warmup = torch.optim.AdamW(
-            [p for g in param_groups for p in g["params"] if g["label"] in ("scale", "lora")],
+            [p for g in param_groups for p in g["params"] if g["label"] == "codebook"],
             lr=lr,
             weight_decay=0.01,
         )
-        codebook_params = [p for g in param_groups for p in g["params"] if g["label"] == "codebook"]
-        for p in codebook_params:
+        for p in lora_params:
+            p.requires_grad = False
+        for p in scales:
             p.requires_grad = False
 
         
@@ -782,7 +781,7 @@ def finetune_layer_ste(
         
         global_step = 0
         
-        for _ in range(wup_epochs):
+        for _ in range(warm_up_codebook_epochs):
             batch_indices_epoch = torch.randperm(num_samples)[:epoch_samples].chunk(microbatches_per_epoch)
             grad_steps = 0
             loss_numerator = 0.0
@@ -828,13 +827,18 @@ def finetune_layer_ste(
 
         opt_warmup.zero_grad()
         del opt_warmup
-        for p in codebook_params:
+        for p in lora_params:
             p.requires_grad = True
+        for p in scales:
+            p.requires_grad = True
+        for p in codebooks:
+            p.requires_grad = False
 
     # ------------------------------------------------------------------
     # Training bookkeeping
     # ------------------------------------------------------------------
-
+    # train all parameters except codebook (which is frozen after warm-up)
+    param_groups = [g for g in param_groups if g["label"] != "codebook"]
     opt = torch.optim.AdamW(param_groups, weight_decay=0.01)
 
     # LR schedule: constant during index-update phase, then linear decay
