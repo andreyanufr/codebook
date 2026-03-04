@@ -101,14 +101,15 @@ def _ste_recompute_fn(
     soft_assignment = F.softmax(neg_dist_sq, dim=-1)
 
     # Hard assignment (detached)
-    # hard_assignment = F.one_hot(
-    #     self.indexes.long(), num_classes=2 ** self.n_bits
-    # ).to(self.codebook.device, self.codebook.dtype)
-    
-    with torch.cuda.device(codebook.device):
-        hard_assignment = one_hot_uint8_impl(
-            indexes, num_classes=2 ** n_bits, dtype=codebook.dtype
-        ).to(codebook.device)
+    if codebook.device == torch.device("cpu"):
+        hard_assignment = F.one_hot(
+            indexes.long(), num_classes=2 ** n_bits
+        ).to(codebook.device, codebook.dtype)
+    else:
+        with torch.cuda.device(codebook.device):
+            hard_assignment = one_hot_uint8_impl(
+                indexes, num_classes=2 ** n_bits, dtype=codebook.dtype
+            ).to(codebook.device)
 
     # STE trick: forward value = hard, backward gradient = soft
     assignment = hard_assignment + (soft_assignment - soft_assignment.detach())
@@ -382,10 +383,15 @@ class CodebookLoRASTELinear(nn.Module):
         #     self.indexes.long(), num_classes=2 ** self.n_bits
         # ).to(self.codebook.device, self.codebook.dtype)
         
-        with torch.cuda.device(codebook.device):
-            one_hot = one_hot_uint8_impl(
-                self.indexes, num_classes=2 ** self.n_bits, dtype=self.codebook.dtype
-            ).to(self.codebook.device)
+        if codebook.device == torch.device("cpu"):
+            one_hot = F.one_hot(
+                self.indexes.long(), num_classes=2 ** self.n_bits
+            ).to(codebook.device, codebook.dtype)
+        else:
+            with torch.cuda.device(codebook.device):
+                one_hot = one_hot_uint8_impl(
+                    self.indexes, num_classes=2 ** self.n_bits, dtype=self.codebook.dtype
+                ).to(self.codebook.device)
         
         weight = (codebook * one_hot).sum(dim=-1)
 
