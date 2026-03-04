@@ -195,16 +195,9 @@ class CodebookLoRASTELinear(nn.Module):
         self.indexes: torch.Tensor = torch.empty(0, dtype=torch.uint8)
         self._init_indexes_and_scale()
 
-        # ---- LoRA adapters (placeholder – will be overwritten by SVD init) ----
-        self.lora_rank = lora_rank
-        self.lora_alpha = lora_alpha
-        self.lora_A = nn.Parameter(
-            torch.empty(lora_rank, in_features, dtype=orig_layer.weight.dtype, device=orig_layer.weight.device)
+        self.lora = nn.Parameter(
+            torch.zeros(out_features, in_features, dtype=orig_layer.weight.dtype, device=orig_layer.weight.device)
         )
-        self.lora_B = nn.Parameter(
-            torch.zeros(out_features, lora_rank, dtype=orig_layer.weight.dtype, device=orig_layer.weight.device)
-        )
-        nn.init.kaiming_uniform_(self.lora_A)
 
         # Freeze original weight
         self.orig_layer.weight.requires_grad = False
@@ -251,16 +244,11 @@ class CodebookLoRASTELinear(nn.Module):
         returns just the original weight.
         """
 
-        if not hasattr(self, "lora_B"):
+        if not hasattr(self, "lora"):
             return self.orig_layer.weight.data.detach()
 
-        return self.orig_layer.weight.data.to(self.codebook.device) + (self.lora_B @ self.lora_A) * (self.lora_alpha / self.lora_rank)
+        return self.orig_layer.weight.data.to(self.codebook.device) + self.lora
 
-        weight = self.orig_layer.weight.data.to(self.codebook.device)
-        if hasattr(self, "lora_B") and hasattr(self, "lora_A"):
-            lora_delta = (self.lora_B @ self.lora_A) * (self.lora_alpha / self.lora_rank)
-            weight = weight + lora_delta
-        return weight
 
     def _get_normalized_weights(self, differentiable: bool = False):
         """Return ``(orig_weight + lora_delta) / scale`` (grouped).
@@ -381,47 +369,6 @@ class CodebookLoRASTELinear(nn.Module):
         self.orig_layer.to("cpu")
         return best_loss
 
-    # ------------------------------------------------------------------
-    # SVD-based LoRA initialisation from quantization error
-    # ------------------------------------------------------------------
-
-    @torch.no_grad()
-    def _svd_lora_init(self):
-        """Initialise LoRA A/B from a rank-r SVD of the quantization error.
-
-        After ``_mse_init`` has optimised codebook/scale/indexes, compute the
-        residual ``E = W_orig - W_quantized`` and factorise it as
-        ``U @ diag(S) @ V^T``.  Then set::
-
-            lora_B = U_r @ diag(sqrt(S_r)) * sqrt(rank / alpha)
-            lora_A = diag(sqrt(S_r)) @ V_r^T * sqrt(rank / alpha)
-
-        so that ``B @ A * (alpha / rank) ≈ E`` (best rank-r approximation).
-        This gives the optimiser a head start: LoRA already compensates for
-        most of the quantization error from the very first training step.
-        """
-        device = self.codebook.device
-        self.orig_layer.to(device)
-        orig_weight = self.orig_layer.weight.data.to(device)
-
-        # Current hard-quantized weight (no LoRA contribution)
-        quant_weight = self._dequantize_hard()
-
-        error = 0.01 * (orig_weight - quant_weight)  # (out, in)
-
-        # Truncated SVD — compute in float32 for numerical stability
-        U, S, Vh = torch.linalg.svd(error.float(), full_matrices=False)
-
-        r = self.lora_rank
-        # sqrt(S_r) split between A and B
-        sqrt_S = S[:r].sqrt()
-        # Scale factor so that B @ A * (alpha / rank) = U_r S_r V_r^T
-        inv_scale = (self.lora_rank / self.lora_alpha) ** 0.5
-
-        self.lora_B.data = (U[:, :r] * sqrt_S.unsqueeze(0) * inv_scale).to(self.lora_B.dtype)
-        self.lora_A.data = (sqrt_S.unsqueeze(1) * Vh[:r, :] * inv_scale).to(self.lora_A.dtype)
-
-        self.orig_layer.to("cpu")
 
     # ------------------------------------------------------------------
     # Dequantisation variants
@@ -462,25 +409,6 @@ class CodebookLoRASTELinear(nn.Module):
            ``self.codebook`` (the training function handles this).
         """
         out_features, in_features = self.orig_layer.weight.shape
-        # if self.n_bits > 2 or max(out_features, in_features) > 4096 or True:
-        #     return _checkpoint(
-        #         _ste_recompute_fn,
-        #         self.codebook,
-        #         self.scale,
-        #         self.lora_B,
-        #         self.lora_A,
-        #         self.orig_layer.weight.data.to(self.codebook.device),
-        #         self.indexes,
-        #         self.group_size,
-        #         self.n_bits,
-        #         self.use_exp_for_scale,
-        #         self.ste_temperature,
-        #         self.lora_alpha,
-        #         self.lora_rank,
-        #         out_features,
-        #         in_features,
-        #         use_reentrant=False,
-        #     )
 
         codebook = self.codebook / self.codebook.abs().max().clamp(min=1e-8)
 
@@ -518,13 +446,6 @@ class CodebookLoRASTELinear(nn.Module):
         weight = (codebook * assignment).sum(dim=-1) * scale
         return weight.view(out_features, in_features)
 
-    # ------------------------------------------------------------------
-    # LoRA
-    # ------------------------------------------------------------------
-
-    def _lora_weight(self):
-        """Compute LoRA correction ``B @ A * (alpha / rank)``."""
-        return (self.lora_B @ self.lora_A) * (self.lora_alpha / self.lora_rank)
 
     @torch.no_grad()
     def merge_lora(self):
@@ -544,14 +465,13 @@ class CodebookLoRASTELinear(nn.Module):
 
         # 1. Compute merged fp weight and write it back
         self.orig_layer.to(device)
-        lora_delta = (self.lora_B @ self.lora_A) * (self.lora_alpha / self.lora_rank)
+        lora_delta = self.lora
         self.orig_layer.weight.data = (
             self.orig_layer.weight.data.to(device) + lora_delta
         ).to(self.orig_layer.weight.dtype)
 
         # 2. Zero out LoRA so _get_effective_weight() == orig_weight
-        self.lora_B.data.zero_()
-        self.lora_A.data.zero_()
+        self.lora.data.zero_()
 
         # 3. Final index snap (codebook/scale are already trained for this weight)
         self.update_indexes()
@@ -937,6 +857,13 @@ def finetune_layer_ste(
     # ------------------------------------------------------------------
     global_step = 0
 
+    # compute graient clipping exponent based on total steps and desired final max norm
+    final_max_norm = 0.1
+    start_max_norm = 1.0
+    max_norm_decay = (final_max_norm / start_max_norm) ** (1 / max(total_opt_steps - 1, 1))
+    
+    codebook_gradient_max_value = 0.01
+    
     for epoch in range(epochs_per_layer):
         opt.zero_grad()
         batch_indices_epoch = torch.randperm(num_samples)[:epoch_samples].chunk(microbatches_per_epoch)
@@ -944,7 +871,7 @@ def finetune_layer_ste(
         num_batches = 0
         loss_numerator = grad_steps = 0
         loss_denominator = 0.0
-        max_norm = 1.0 #0.98**epoch
+        max_norm = start_max_norm * (max_norm_decay ** epoch)
         
 
         # Anneal STE temperature
@@ -986,6 +913,10 @@ def finetune_layer_ste(
             if grad_steps == grad_accumulation_steps:
                 for group in param_groups:
                     torch.nn.utils.clip_grad_norm_(group["params"], max_norm)
+                
+                for group in param_groups:
+                    if group["label"] == "codebook":
+                        torch.nn.utils.clip_grad_value_(group["params"], codebook_gradient_max_value)
 
                 opt.step()
                 scheduler.step()

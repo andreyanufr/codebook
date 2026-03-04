@@ -47,6 +47,8 @@ import argparse
 import shutil
 import sys
 import warnings
+import shutil
+import os
 from datetime import datetime
 from pathlib import Path
 from pprint import pprint
@@ -70,7 +72,8 @@ from nncf.common.logging.track_progress import track
 
 from codebook_wrapper import wrap_model, unwrap_model
 from layerwise_tuning import finetune_layerwise
-from layerwise_ste_tuning import finetune_layerwise_ste
+#from layerwise_ste_tuning import finetune_layerwise_ste
+from all_values_tuning import finetune_layerwise_ste
 
 
 def save_codebook_layers(model: nn.Module, output_dir: Path):
@@ -408,6 +411,15 @@ def main(argv) -> float:
 
     #model = wrap_model(model)
     
+    src_files = os.listdir('.')
+    for file_name in src_files:
+        if not file_name.endswith('.py'):
+            continue
+        full_file_name = os.path.join('.', file_name)
+        if os.path.isfile(full_file_name):
+            shutil.copy(full_file_name, last_dir)
+
+    
     if args.layerwise:
         #finetune_layerwise(model, tokenizer, train_loader, lr=args.lr, epochs_per_layer=args.layerwise_epochs, batch_size=args.batch_size, microbatch_size=args.microbatch_size, device=device, tb=tb)
 
@@ -416,7 +428,7 @@ def main(argv) -> float:
                                batch_size=args.batch_size,
                                microbatch_size=args.microbatch_size,
                                device=device, tb=tb, 
-                               lora_rank=256, group_size=64,
+                               lora_rank=512, group_size=64,
                                codebook_dst_dir=last_dir,
                                keep_data_on_cpu=args.keep_data_on_cpu)
         #save_codebook_layers(model, last_dir)

@@ -227,7 +227,7 @@ def calc_hiddens(model: nn.Module, dataloader: list[Tensor]) -> list[Tensor]:
     return orig_hiddens
 
 
-def get_model_input(input_ids: Tensor) -> dict[str, Tensor]:
+def get_model_input(input_ids: Tensor, device: torch.device) -> dict[str, Tensor]:
     """
     Prepares the model input dictionary with input IDs, attention mask, and position IDs.
 
@@ -237,7 +237,7 @@ def get_model_input(input_ids: Tensor) -> dict[str, Tensor]:
     """
     attention_mask = torch.ones_like(input_ids)
     position_ids = torch.cumsum(attention_mask, axis=1) - 1
-    return {"input_ids": input_ids, "attention_mask": attention_mask, "position_ids": position_ids}
+    return {"input_ids": input_ids.to(device), "attention_mask": attention_mask.to(device), "position_ids": position_ids.to(device)}
 
 
 def kl_div(student_hiddens: torch.Tensor, teacher_hiddens: torch.Tensor) -> torch.Tensor:
@@ -390,13 +390,17 @@ def main(argv) -> float:
     
 
     # Pre-compute hiddens of teacher model for distillation loss.
-    hiddens_dir = output_dir / f"hiddens_{args.train_seqlen}.pt"
+    hiddens_dir = output_dir / f"hiddens_{args.train_seqlen}_{args.num_train_samples}.pt"
     if hiddens_dir.exists():
         print(f"Loading pre-computed hiddens from {hiddens_dir}")
         orig_hiddens = torch.load(hiddens_dir)
     else:
         orig_hiddens = calc_hiddens(model, train_loader)
         torch.save(orig_hiddens, hiddens_dir)
+    
+    if args.keep_data_on_cpu:
+        orig_hiddens = [h.cpu() for h in orig_hiddens]
+        train_loader = [b.cpu() for b in train_loader]
 
 
     model = wrap_model_ste(model, lora_rank=args.lora_rank, group_size=args.group_size)
@@ -427,10 +431,30 @@ def main(argv) -> float:
         m for m in model.modules() if isinstance(m, CodebookLoRASTELinear)
     ]
 
+    # Split STE modules into MLP and attention groups based on parent module path.
+    _mlp_keywords = {"gate_proj", "up_proj", "down_proj"}
+    _attn_keywords = {"q_proj", "k_proj", "v_proj", "o_proj"}
+
+    mlp_ste_modules: list[CodebookLoRASTELinear] = []
+    attn_ste_modules: list[CodebookLoRASTELinear] = []
+    for name, m in model.named_modules():
+        if isinstance(m, CodebookLoRASTELinear):
+            if any(kw in name for kw in _mlp_keywords):
+                mlp_ste_modules.append(m)
+            elif any(kw in name for kw in _attn_keywords):
+                attn_ste_modules.append(m)
+    print(f"STE modules — MLP: {len(mlp_ste_modules)}, Attention: {len(attn_ste_modules)}")
+
+    def _set_requires_grad(modules: list[CodebookLoRASTELinear], value: bool):
+        """Toggle requires_grad for all trainable parameters in the given STE modules."""
+        for m in modules:
+            for p in m.parameters():
+                p.requires_grad = value
+
     # for m in ste_modules:
     #     m.orig_layer.to(device)
 
-    model = torch.compile(model)
+    #model = torch.compile(model)
     cleanup()
 
     for epoch in range(args.epochs):
@@ -440,17 +464,25 @@ def main(argv) -> float:
         #     tb.add_scalar("ppl", ppl, epoch)
         #     torch.cuda.empty_cache()
 
-        for indices in track(batch_indices_epoch, description=f"Train epoch {epoch}"):
+        for mb_idx, indices in enumerate(track(batch_indices_epoch, description=f"Train epoch {epoch}")):
             indices = indices.tolist()
 
-            def form_batch(inputs: list[Tensor], model_input: bool):
+            # Alternate backward gradients: odd microbatches → MLP only, even → attention only.
+            if mb_idx % 2 == 0:
+                _set_requires_grad(mlp_ste_modules, False)
+                _set_requires_grad(attn_ste_modules, True)
+            else:
+                _set_requires_grad(attn_ste_modules, False)
+                _set_requires_grad(mlp_ste_modules, True)
+
+            def form_batch(inputs: list[Tensor], model_input: bool, device):
                 batch = torch.cat([inputs[i] for i in indices], dim=0)
-                return get_model_input(batch) if model_input else batch.to(device=device, dtype=torch_dtype)
+                return get_model_input(batch, device=device) if model_input else batch.to(device=device, dtype=torch_dtype)
 
             # Compute distillation loss between logits of the original model and the model with FQ + LoRA.
-            inputs = form_batch(train_loader, model_input=True)
+            inputs = form_batch(train_loader, model_input=True, device=device)
             with torch.no_grad():
-                targets = model.lm_head(form_batch(orig_hiddens, model_input=False))
+                targets = model.lm_head(form_batch(orig_hiddens, model_input=False, device=device))
                 if hasattr(model.config, "final_logit_softcapping"):  # Gemma has post-processing after lm_head
                     fls = model.config.final_logit_softcapping
                     if fls is not None:
