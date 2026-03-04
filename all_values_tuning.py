@@ -44,6 +44,7 @@ from layerwise_tuning import (
 
 from one_hot_uint8 import one_hot as one_hot_uint8_impl
 from pack_unpack import pack_4bit, pack_2bit
+from pack_unpack import unpack_4bit, unpack_2bit
 
 
 from torch.utils.checkpoint import checkpoint as _checkpoint
@@ -550,6 +551,54 @@ def save_codebook_layers(model: nn.Module, output_dir: Path):
     print(f"Codebook layers saved to {output_dir / 'codebook_layers.pth'}")
 
 
+def dequantize_from_dict(state_dict: dict, device: torch.device) -> Tensor:
+    # dequantize weight from codebook, scale, and indexes in state_dict
+    # {
+    #     "codebook": self.codebook.data.cpu(),
+    #     "scale": self.scale.data.cpu(),
+    #     "shape": self.orig_layer.weight.shape,
+    #     "indexes": self.get_compressed_indexes().cpu(),
+    # }
+    codebook = state_dict["codebook"].to(device)
+    scale = state_dict["scale"].to(device)
+    shape = state_dict["shape"]
+    indexes = state_dict["indexes"].to(device)
+    
+    
+    if indexes.dtype == torch.uint8 and codebook.shape[0] == 16:
+        indexes = unpack_4bit(indexes)
+    elif indexes.dtype == torch.uint8 and codebook.shape[0] == 4:
+        indexes = unpack_2bit(indexes)
+
+    codebook = codebook / codebook.abs().max().clamp(min=1e-8)
+    one_hot = F.one_hot(
+        indexes.long(), num_classes=codebook.shape[0]
+    ).to(codebook.device, codebook.dtype)
+
+    weight = (codebook * one_hot).sum(dim=-1)
+    weight = weight * scale.exp()
+
+    out_features, in_features = shape
+    return weight.view(out_features, in_features)
+
+    # scale = scale.exp()
+    
+    # out_features, in_features = shape
+    
+    # # normalize codebook
+    # codebook = codebook / codebook.abs().max().clamp(min=1e-8)
+    
+    # # unpack indexes if needed
+    # if indexes.dtype == torch.uint8 and codebook.shape[0] == 16:
+    #     indexes = unpack_4bit(indexes)
+    # elif indexes.dtype == torch.uint8 and codebook.shape[0] == 4:
+    #     indexes = unpack_2bit(indexes)
+    
+    # w = (codebook[indexes.flatten().long()].reshape(indexes.shape)) * scale
+    # return w.view(out_features, in_features)
+    
+    
+
 # ---------------------------------------------------------------------------
 # Wrap / unwrap helpers
 # ---------------------------------------------------------------------------
@@ -675,7 +724,7 @@ def finetune_layer_ste(
     ste_temp_end: float = 0.01,
     index_update_epochs: int = 4,
     keep_data_on_cpu: bool = True,
-    warm_up_codebook_epochs: int = 2,
+    warm_up_codebook_epochs: int = 4,
 ) -> nn.Module:
     """Fine-tune a single transformer block using STE + LoRA with L2 loss.
 
@@ -706,8 +755,9 @@ def finetune_layer_ste(
     scales: list[nn.Parameter] = []
     lora_params: list[nn.Parameter] = []
     
-    
-    layer = torch.compile(layer)
+    # lead to NaN in one A100 GPU
+    if torch.cuda.device_count() > 1:
+        layer = torch.compile(layer)
 
     for name, param in layer.named_parameters():
         if "codebook" in name:
@@ -723,8 +773,8 @@ def finetune_layer_ste(
             param.requires_grad = False
 
     param_groups = [
-        #{"params": codebooks, "lr": lr, "label": "codebook"},
-        {"params": scales, "lr": 10 * lr, "label": "scale"},
+        {"params": codebooks, "lr": lr, "label": "codebook"},
+        {"params": scales, "lr": lr, "label": "scale"},
         {"params": lora_params, "lr": 0.1 * lora_lr, "label": "lora"},
     ]
     # Drop empty groups
@@ -1162,7 +1212,7 @@ def finetune_layerwise_ste(
             layer_idx=layer_idx,
             lr=lr,
             lora_lr=lora_lr,
-            epochs_per_layer=epochs_per_layer,
+            epochs_per_layer=epochs_per_layer + layer_idx,  # optional: increase epochs for deeper layers
             batch_size=batch_size,
             microbatch_size=microbatch_size,
             device=device,
