@@ -70,11 +70,8 @@ from transformers import AutoTokenizer
 
 from nncf.common.logging.track_progress import track
 
-from codebook_wrapper import wrap_model, unwrap_model
-from layerwise_tuning import finetune_layerwise
-#from layerwise_ste_tuning import finetune_layerwise_ste
-#from all_values_tuning import finetune_layerwise_ste
-from two_step_tuning import finetune_layerwise_ste
+
+from two_step_tuning import finetune_layerwise_ste, wrap_model_ste, unwrap_model_ste, cleanup
 
 def save_codebook_layers(model: nn.Module, output_dir: Path):
     """
@@ -97,17 +94,23 @@ def set_trainable(model: nn.Module) -> list[nn.Parameter]:
     :param fq_lr: The learning rate for Fake Quantization parameters.
     :return: A list of trainable parameters in the model.
     """
-    param_to_train = []
+    lora_to_train = []
+    scales_to_train = []
+    codebooks_to_train = []
+    
     for name, param in model.named_parameters():
-        if "codebook" in name or "scale" in name:
+        if "codebook" in name:
             param.requires_grad = True
-            param_to_train.append(param)
+            codebooks_to_train.append(param)
         elif "lora" in name:
             param.requires_grad = True
-            param_to_train.append(param)
+            lora_to_train.append(param)
+        elif "scale" in name:
+            param.requires_grad = True
+            scales_to_train.append(param)
         else:
             param.requires_grad = False
-    return param_to_train
+    return lora_to_train, scales_to_train, codebooks_to_train
 
 
 warnings.filterwarnings("ignore", category=TracerWarning)
@@ -441,7 +444,7 @@ def main(argv) -> float:
         return
 
     # Pre-compute hiddens of teacher model for distillation loss.
-    hiddens_dir = output_dir / "hiddens.pt"
+    hiddens_dir = output_dir / f"hiddens_{args.num_train_samples}_{args.train_seqlen}.pt"
     if hiddens_dir.exists():
         print(f"Loading pre-computed hiddens from {hiddens_dir}")
         orig_hiddens = torch.load(hiddens_dir)
@@ -450,8 +453,11 @@ def main(argv) -> float:
         torch.save(orig_hiddens, hiddens_dir)
 
 
-    model = wrap_model(model)
+    model = wrap_model_ste(model)
     torch.cuda.empty_cache()
+    
+    if torch.cuda.device_count() > 1:
+        model = torch.compile(model)
 
     # Original full-model training with KL divergence
     print("\n" + "="*80)
@@ -459,13 +465,16 @@ def main(argv) -> float:
     print("="*80 + "\n")
     
 
-    param_to_train = set_trainable(model)
-    opt = torch.optim.AdamW(param_to_train, lr=args.lr)
+    lora_to_train, scales_to_train, codebooks_to_train = set_trainable(model)
+    params_to_train = [
+        {"params": codebooks_to_train, "lr": args.lr, "label": "codebook"},
+        {"params": scales_to_train, "lr": args.lr, "label": "scale"},
+        {"params": lora_to_train, "lr": 0.1 * args.lr, "label": "lora"},
+    ]
     
-    lambda_lr = lambda epoch: 0.99 ** epoch
-    scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lambda_lr)
-
-    # Run tuning with distillation loss and validation after each epoch.
+    # first stage train only codebooks
+    first_stage_epochs = max(args.epochs // 4, 1)
+    
     grad_accumulation_steps = args.batch_size // args.microbatch_size
     num_samples = len(train_loader)
     epoch_samples = num_samples - num_samples % args.microbatch_size
@@ -474,12 +483,24 @@ def main(argv) -> float:
     loss_numerator = grad_steps = total_steps = 0
     update_indexes_counter = 0
     
-    for epoch in range(args.epochs):
+    opt = torch.optim.AdamW(params_to_train[0]["params"], lr=args.lr)
+    for p in scales_to_train:
+        p.requires_grad = False
+    for p in lora_to_train:
+        p.requires_grad = False
+    
+    aggregated_loss = float("nan")
+    loss_numerator = grad_steps = total_steps = 0
+    # lambda_lr = lambda epoch: 0.99 ** epoch
+    # scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lambda_lr)
+
+    total_wup_opt_steps = first_stage_epochs * epoch_samples // args.batch_size    
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, eta_min=args.lr * 1e-4, T_max=total_wup_opt_steps)
+
+    
+    for epoch in range(first_stage_epochs):
         batch_indices_epoch = torch.randperm(num_samples)[:epoch_samples].chunk(microbatches_per_epoch)
-        if epoch > 300 and epoch % 2 == 0:
-            ppl = measure_perplexity(model)
-            tb.add_scalar("ppl", ppl, epoch)
-            torch.cuda.empty_cache()
+        opt.zero_grad()
 
         for indices in track(batch_indices_epoch, description=f"Train epoch {epoch}"):
             indices = indices.tolist()
@@ -516,21 +537,97 @@ def main(argv) -> float:
                 aggregated_loss = loss_numerator / grad_steps
                 loss_numerator = grad_steps = 0
                 total_steps += 1
-                tb.add_scalar("loss", aggregated_loss, total_steps)
-                tb.add_scalar("lr", opt.param_groups[0]["lr"], total_steps)
+                tb.add_scalar("first_stage_loss", aggregated_loss, total_steps)
+                tb.add_scalar("first_stage_lr", opt.param_groups[0]["lr"], total_steps)
 
-                # update_indexes_counter += 1
-                # if update_indexes_counter % 5 == 0:
-                if epoch < 1:
-                    update_indexes(model)
+                if aggregated_loss < 0.007:
+                    print(f"Early stopping at epoch {epoch} with loss {aggregated_loss:.6f}")
+                    break
+                
+                cleanup()
+                scheduler.step()
+    
+    del opt
+    del scheduler
+    cleanup()
+    
+    
+    for p in scales_to_train:
+        p.requires_grad = True
+    for p in lora_to_train:
+        p.requires_grad = True
+    for p in codebooks_to_train:
+        p.requires_grad = False
+
+    opt = torch.optim.AdamW([params_to_train[1], params_to_train[2]])
+    
+    # lambda_lr = lambda epoch: 0.99 ** epoch
+    # scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lambda_lr)
+
+    total_steps = args.epochs * epoch_samples // args.batch_size    
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, eta_min=args.lr * 1e-4, T_max=total_steps)
+    
+    # Run tuning with distillation loss and validation after each epoch.
+    
+    aggregated_loss = float("nan")
+    loss_numerator = grad_steps = total_steps = 0
+    
+    for epoch in range(args.epochs):
+        batch_indices_epoch = torch.randperm(num_samples)[:epoch_samples].chunk(microbatches_per_epoch)
+        # if epoch > 300 and epoch % 2 == 0:
+        #     ppl = measure_perplexity(model)
+        #     tb.add_scalar("ppl", ppl, epoch)
+        #     torch.cuda.empty_cache()
+
+        for indices in track(batch_indices_epoch, description=f"Train epoch {epoch}"):
+            indices = indices.tolist()
+
+            def form_batch(inputs: list[Tensor], model_input: bool):
+                batch = torch.cat([inputs[i] for i in indices], dim=0)
+                return get_model_input(batch) if model_input else batch.to(device=device, dtype=torch_dtype)
+
+            # Compute distillation loss between logits of the original model and the model with FQ + LoRA.
+            inputs = form_batch(train_loader, model_input=True)
+            with torch.no_grad():
+                targets = model.lm_head(form_batch(orig_hiddens, model_input=False))
+                if hasattr(model.config, "final_logit_softcapping"):  # Gemma has post-processing after lm_head
+                    fls = model.config.final_logit_softcapping
+                    if fls is not None:
+                        targets = targets / fls
+                        targets = torch.tanh(targets)
+                        targets = targets * fls
+            outputs = model(**inputs).logits
+            loss = kl_div(outputs, targets.to(dtype=torch_dtype, device=device))
+
+            # Perform an optimization step after accumulating gradients over multiple minibatches.
+            loss_numerator += loss.item()
+            grad_steps += 1
+            if not torch.isfinite(loss).item():
+                err = f"Fine-tuning loss is {loss}"
+                raise ValueError(err)
+            (loss / grad_accumulation_steps).backward()
+            if grad_steps == grad_accumulation_steps:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+                opt.zero_grad()
+                
+                aggregated_loss = loss_numerator / grad_steps
+                loss_numerator = grad_steps = 0
+                total_steps += 1
+                tb.add_scalar("second_stage_loss", aggregated_loss, total_steps)
+                tb.add_scalar("second_stage_lr", opt.param_groups[0]["lr"], total_steps)
 
                 if aggregated_loss < 0.007:
                     print(f"Early stopping at epoch {epoch} with loss {aggregated_loss:.6f}")
                     break
 
-        scheduler.step()
+                scheduler.step()
+                cleanup()
 
-    model = unwrap_model(model)
+    if hasattr(model, "_orig_mod"):
+        model = model._orig_mod
+        
+    model = unwrap_model_ste(model)
     model.save_pretrained(last_dir)
     tokenizer.save_pretrained(last_dir)
     

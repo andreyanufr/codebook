@@ -45,14 +45,15 @@ def main(argv):
     parser = get_argument_parser()
     args = parser.parse_args(argv)
     
-    model = AutoModelForCausalLM.from_pretrained(args.pretrained, torch_dtype=torch.float16, device_map="cpu")
+    model = AutoModelForCausalLM.from_pretrained(args.pretrained, torch_dtype=torch.float16, device_map="auto")
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained)
     codebooks = torch.load(args.codebooks_path, map_location="cpu") if args.codebooks_path and Path(args.codebooks_path).is_file() else {}
     
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear) and name in codebooks:
-            module.weight.data = dequantize_from_dict(codebooks[name], "cpu")
-    
+            print(name, codebooks[name]["codebook"])
+            module.weight.data = dequantize_from_dict(codebooks[name],  module.weight.data.device)
+
     # Save the model with the applied codebooks
     model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
