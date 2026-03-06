@@ -150,7 +150,7 @@ class CodebookLoRASTELinear(nn.Module):
         self.orig_layer.weight.requires_grad = False
 
         # Weight-space MSE init for codebook + scale
-        #self._mse_init()
+        self._mse_init()
 
         # ---- Initialise LoRA from SVD of quantization error ----
         #self._svd_lora_init()
@@ -933,7 +933,7 @@ def finetune_layer_ste(
     print(f"  Merging LoRA into codebook representation ...")
     for m in ste_modules:
         m.training_mode_ste = False
-        #m.check_hard_and_ste_consistency()
+        m.check_hard_and_ste_consistency()
         m.merge_lora()
 
     del opt, scheduler

@@ -453,7 +453,7 @@ def main(argv) -> float:
         torch.save(orig_hiddens, hiddens_dir)
 
 
-    model = wrap_model_ste(model)
+    model = wrap_model_ste(model, lora_rank=args.lora_rank, group_size=32)
     torch.cuda.empty_cache()
     
     if torch.cuda.device_count() > 1:
@@ -626,7 +626,11 @@ def main(argv) -> float:
 
     if hasattr(model, "_orig_mod"):
         model = model._orig_mod
-        
+
+    for m in model.modules():
+        if hasattr(m, "merge_lora"):
+            m.merge_lora()
+
     model = unwrap_model_ste(model)
     model.save_pretrained(last_dir)
     tokenizer.save_pretrained(last_dir)
