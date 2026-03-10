@@ -473,7 +473,7 @@ def main(argv) -> float:
     ]
     
     # first stage train only codebooks
-    first_stage_epochs = max(args.epochs // 4, 1)
+    first_stage_epochs = 2 # max(args.epochs // 4, 1)
     
     grad_accumulation_steps = args.batch_size // args.microbatch_size
     num_samples = len(train_loader)

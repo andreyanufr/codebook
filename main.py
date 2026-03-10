@@ -74,7 +74,9 @@ from codebook_wrapper import wrap_model, unwrap_model
 from layerwise_tuning import finetune_layerwise
 #from layerwise_ste_tuning import finetune_layerwise_ste
 #from all_values_tuning import finetune_layerwise_ste
-from two_step_tuning import finetune_layerwise_ste
+#from one_stage_tuning import finetune_layerwise_ste
+
+from not_fixed_codebook import finetune_layerwise_ste
 
 def save_codebook_layers(model: nn.Module, output_dir: Path):
     """
@@ -428,7 +430,7 @@ def main(argv) -> float:
                                batch_size=args.batch_size,
                                microbatch_size=args.microbatch_size,
                                device=device, tb=tb, 
-                               lora_rank=512, group_size=64,
+                               lora_rank=1024, group_size=32 if '1B' in args.pretrained else 64,
                                codebook_dst_dir=last_dir,
                                keep_data_on_cpu=args.keep_data_on_cpu)
         #save_codebook_layers(model, last_dir)

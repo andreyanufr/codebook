@@ -44,6 +44,7 @@ from layerwise_tuning import (
 
 from one_hot_uint8 import one_hot as one_hot_uint8_impl
 from pack_unpack import pack_4bit, pack_2bit
+from pack_unpack import unpack_4bit, unpack_2bit
 
 
 from torch.utils.checkpoint import checkpoint as _checkpoint
@@ -51,72 +52,6 @@ from torch.utils.checkpoint import checkpoint as _checkpoint
 
 # ---------------------------------------------------------------------------
 # _ste_recompute_fn – pure function wrapped by torch.utils.checkpoint
-# ---------------------------------------------------------------------------
-
-def _ste_recompute_fn(
-    codebook_raw: Tensor,
-    scale_raw: Tensor,
-    lora_B: Tensor,
-    lora_A: Tensor,
-    orig_weight: Tensor,
-    indexes: Tensor,
-    group_size: int,
-    n_bits: int,
-    use_exp_for_scale: bool,
-    temperature: float,
-    lora_alpha: float,
-    lora_rank: int,
-    out_features: int,
-    in_features: int,
-) -> Tensor:
-    """STE dequantisation with gather-based hard path (optimal for 4-bit).
-
-    Called inside ``torch.utils.checkpoint`` so that the large intermediate
-    tensors (``soft_assignment``, ``neg_dist_sq`` – both shape
-    ``(out, in//gs, gs, 2^n_bits)``) are discarded after forward and
-    **recomputed** during backward, saving significant GPU memory.
-
-    The hard-assignment path uses a direct gather ``codebook[indexes]``
-    instead of building a full one-hot tensor.  For 4-bit codebooks this
-    avoids materialising a tensor 16× the weight size.
-    """
-    codebook = codebook_raw / codebook_raw.abs().max().clamp(min=1e-8)
-
-    effective_weight = orig_weight + (lora_B @ lora_A) * (lora_alpha / lora_rank)
-    effective_weight_grouped = effective_weight.view(
-        out_features, in_features // group_size, group_size
-    )
-
-    # Gradient flows through scale and LoRA here
-    if use_exp_for_scale:
-        scale = scale_raw.exp()
-    else:
-        scale = scale_raw
-    iscale = get_reciprocal(scale)
-    normalized = effective_weight_grouped * iscale
-
-    # Soft assignment (differentiable w.r.t. codebook, scale, and LoRA)
-    neg_dist_sq = -(normalized.unsqueeze(-1) - codebook).pow(2) / temperature
-    soft_assignment = F.softmax(neg_dist_sq, dim=-1)
-
-    # Hard assignment (detached)
-    # hard_assignment = F.one_hot(
-    #     self.indexes.long(), num_classes=2 ** self.n_bits
-    # ).to(self.codebook.device, self.codebook.dtype)
-    
-    with torch.cuda.device(codebook.device):
-        hard_assignment = one_hot_uint8_impl(
-            indexes, num_classes=2 ** n_bits, dtype=codebook.dtype
-        ).to(codebook.device)
-
-    # STE trick: forward value = hard, backward gradient = soft
-    assignment = hard_assignment + (soft_assignment - soft_assignment.detach())
-
-    weight = (codebook * assignment).sum(dim=-1) * scale
-    return weight.view(out_features, in_features)
-
-# ---------------------------------------------------------------------------
-# CodebookLoRASTELinear – linear layer with codebook quant + STE + LoRA
 # ---------------------------------------------------------------------------
 
 class CodebookLoRASTELinear(nn.Module):
@@ -152,10 +87,11 @@ class CodebookLoRASTELinear(nn.Module):
         orig_layer: nn.Linear,
         group_size: int = 32,
         n_bits: int = 2,
-        lora_rank: int = 32,
+        lora_rank: int = -1,
         lora_alpha: float = 32.0,
         use_exp_for_scale: bool = True,
         ste_temperature: float = 1.0,
+        codebook_stage: bool = False,  # If True, only initialize codebook/scale/indexes without LoRA (for ablation)
     ):
         super().__init__()
 
@@ -177,6 +113,7 @@ class CodebookLoRASTELinear(nn.Module):
         # ---- Codebook ----
         if n_bits == 2:
             initial_codebook = torch.tensor(
+                #[-1.0, -0.25, 0.0, 1.0],
                 [-1.0, -0.25, 0.25, 1.0],
                 dtype=orig_layer.weight.dtype,
                 device=orig_layer.weight.device,
@@ -191,20 +128,23 @@ class CodebookLoRASTELinear(nn.Module):
 
         self.codebook = nn.Parameter(initial_codebook, requires_grad=True)
 
-        # ---- Scale & indexes ----
-        self.indexes: torch.Tensor = torch.empty(0, dtype=torch.uint8)
+        # ---- Scale ----
         self._init_indexes_and_scale()
 
-        # ---- LoRA adapters (placeholder – will be overwritten by SVD init) ----
         self.lora_rank = lora_rank
-        self.lora_alpha = lora_alpha
-        self.lora_A = nn.Parameter(
-            torch.empty(lora_rank, in_features, dtype=orig_layer.weight.dtype, device=orig_layer.weight.device)
-        )
-        self.lora_B = nn.Parameter(
-            torch.zeros(out_features, lora_rank, dtype=orig_layer.weight.dtype, device=orig_layer.weight.device)
-        )
-        nn.init.kaiming_uniform_(self.lora_A)
+        if lora_rank > 0:
+            self.lora_alpha = lora_alpha
+            self.lora_A = nn.Parameter(
+                torch.empty(lora_rank, in_features, dtype=orig_layer.weight.dtype, device=orig_layer.weight.device)
+            )
+            self.lora_B = nn.Parameter(
+                torch.zeros(out_features, lora_rank, dtype=orig_layer.weight.dtype, device=orig_layer.weight.device)
+            )
+            nn.init.kaiming_uniform_(self.lora_A)
+        else:
+            self.lora = nn.Parameter(
+                torch.zeros(out_features, in_features, dtype=orig_layer.weight.dtype, device=orig_layer.weight.device)
+            )
 
         # Freeze original weight
         self.orig_layer.weight.requires_grad = False
@@ -233,16 +173,39 @@ class CodebookLoRASTELinear(nn.Module):
             scale = torch.log(scale)
 
         self.scale = nn.Parameter(scale, requires_grad=True)
-        self.update_indexes()
 
-    @torch.no_grad()
-    def update_indexes(self):
-        """Re-assign each weight position to its nearest codebook entry."""
-        normalized = self._get_normalized_weights(differentiable=False)
-        codebook_norm = self.codebook / self.codebook.abs().max().clamp(min=1e-8)
-        self.indexes = torch.argmin(
-            (normalized.unsqueeze(-1) - codebook_norm).abs(), dim=-1
-        ).to(torch.uint8)
+    #     self.update_indexes()
+
+    # @torch.no_grad()
+    # def update_indexes(self):
+    #     """Re-assign each weight position to its nearest codebook entry."""
+    #     normalized = self._get_normalized_weights(differentiable=False)
+    #     codebook_norm = self.codebook / self.codebook.abs().max().clamp(min=1e-8)
+    #     self.indexes = torch.argmin(
+    #         (normalized.unsqueeze(-1) - codebook_norm).abs(), dim=-1
+    #     ).to(torch.uint8)
+    
+    
+    def dequantize_by_distance(self, codebook, normalized, return_indexes = False):
+        thresholds = (codebook[:-1] + codebook[1:]) * 0.5
+        
+        idx = torch.bucketize(normalized, thresholds)
+        quantized = codebook[idx]
+        
+        if return_indexes:
+            return idx
+        
+        if codebook.requires_grad:
+            # train only codebook
+            one_hot = F.one_hot(
+                idx, num_classes=2 ** self.n_bits
+            ).to(codebook.device, codebook.dtype)
+
+            quantized = (one_hot * codebook).sum(dim=-1)
+            return quantized
+
+        return (quantized - normalized).detach() + normalized
+
 
     def _get_effective_weight(self):
         """Return ``orig_weight + lora_delta`` (2-D, on codebook device).
@@ -251,17 +214,47 @@ class CodebookLoRASTELinear(nn.Module):
         returns just the original weight.
         """
 
-        if not hasattr(self, "lora_B"):
+        if not (hasattr(self, "lora") or hasattr(self, "lora_A")):
             return self.orig_layer.weight.data.detach()
 
-        return self.orig_layer.weight.data.to(self.codebook.device) + (self.lora_B @ self.lora_A) * (self.lora_alpha / self.lora_rank)
+        if self.lora_rank > 0:
+            return self.orig_layer.weight.data.to(self.codebook.device) + (self.lora_B @ self.lora_A) * (self.lora_alpha / self.lora_rank)
 
-        weight = self.orig_layer.weight.data.to(self.codebook.device)
-        if hasattr(self, "lora_B") and hasattr(self, "lora_A"):
-            lora_delta = (self.lora_B @ self.lora_A) * (self.lora_alpha / self.lora_rank)
-            weight = weight + lora_delta
-        return weight
+        return self.orig_layer.weight.data.to(self.codebook.device) + self.lora
 
+
+    # def _get_normalized_weights(self, differentiable: bool = False):
+    #     """Return ``(orig_weight + lora_delta) / scale`` (grouped).
+
+    #     If *differentiable* is True, gradients flow through ``scale``
+    #     and the LoRA parameters.
+    #     """
+    #     if differentiable:
+    #         weight = self._get_effective_weight()
+    #     else:
+    #         with torch.no_grad():
+    #             weight = self._get_effective_weight()
+
+    #     out_features, in_features = weight.shape
+    #     weight = weight.view(
+    #         out_features, in_features // self.group_size, self.group_size
+    #     )
+
+    #     if differentiable:
+    #         if self.use_exp_for_scale:
+    #             iscale = get_reciprocal(self.scale.exp())
+    #         else:
+    #             iscale = get_reciprocal(self.scale)
+    #         return weight * iscale
+    #     else:
+    #         with torch.no_grad():
+    #             if self.use_exp_for_scale:
+    #                 iscale = get_reciprocal(self.scale.exp())
+    #             else:
+    #                 iscale = get_reciprocal(self.scale)
+    #             return weight * iscale
+    
+    
     def _get_normalized_weights(self, differentiable: bool = False):
         """Return ``(orig_weight + lora_delta) / scale`` (grouped).
 
@@ -279,19 +272,42 @@ class CodebookLoRASTELinear(nn.Module):
             out_features, in_features // self.group_size, self.group_size
         )
 
+        add = 0
+
+        # weight = self.orig_layer.weight.data.to(self.codebook.device)
+        # out_features, in_features = weight.shape
+        # if self.lora_rank > 0 and hasattr(self, "lora_A") and hasattr(self, "lora_B"):
+        #     add = (self.lora_B @ self.lora_A) * (self.lora_alpha / self.lora_rank)
+        # elif hasattr(self, "lora"):
+        #     add = self.lora
+
+        # weight = weight.view(
+        #     out_features, in_features // self.group_size, self.group_size
+        # )
+        
+        # if isinstance(add, torch.Tensor):
+        #     add = add.view(out_features, in_features // self.group_size, self.group_size)
+        #     # to avoid overfitting and jumping too far fron near quant we restricted shift by mean distance between codebook entries
+        #     #add = add / add.abs().max().clamp(min=1e-8)
+        #     with torch.no_grad():
+        #        mean_codebook_dist = 0.5 * (self.codebook[1:] - self.codebook[:-1]).abs().mean().detach()
+        #     #add = add * mean_codebook_dist
+        #     #add = add.view(out_features, in_features // self.group_size, self.group_size)
+        #     add = torch.clamp(add, -mean_codebook_dist, mean_codebook_dist).view(out_features, in_features // self.group_size, self.group_size)
+
         if differentiable:
             if self.use_exp_for_scale:
                 iscale = get_reciprocal(self.scale.exp())
             else:
                 iscale = get_reciprocal(self.scale)
-            return weight * iscale
+            return weight * iscale + add
         else:
             with torch.no_grad():
                 if self.use_exp_for_scale:
                     iscale = get_reciprocal(self.scale.exp())
                 else:
                     iscale = get_reciprocal(self.scale)
-                return weight * iscale
+                return weight * iscale + add
 
     # ------------------------------------------------------------------
     # Weight-space MSE initialization (same strategy as CodebookWrapperLinear)
@@ -303,15 +319,11 @@ class CodebookLoRASTELinear(nn.Module):
             raise ValueError("NaNs detected in codebook")
         if torch.isnan(self.scale).any():
             raise ValueError("NaNs detected in scale")
-        if torch.isnan(self.indexes.float()).any():
-            raise ValueError("NaNs detected in indexes")
         
         if not torch.isfinite(self.codebook).all():
             raise ValueError("Non-finite values detected in codebook")
         if not torch.isfinite(self.scale).all():
             raise ValueError("Non-finite values detected in scale")
-        if not torch.isfinite(self.indexes.float()).all():
-            raise ValueError("Non-finite values detected in indexes")
 
 
     def _mse_init(self, n_iters: int = 200, lr: float = 0.01, index_update_interval: int = 25):
@@ -330,7 +342,6 @@ class CodebookLoRASTELinear(nn.Module):
         best_loss = float("inf")
         best_codebook = self.codebook.data.clone()
         best_scale = self.scale.data.clone()
-        best_indexes = self.indexes.clone()
 
         soft_iters = int(n_iters * 0.75)
         temp_start, temp_end = 0.5, 0.01
@@ -340,7 +351,7 @@ class CodebookLoRASTELinear(nn.Module):
 
             if i < soft_iters:
                 temperature = temp_start + (temp_end - temp_start) * (i / max(soft_iters - 1, 1))
-                codebook = self.codebook / self.codebook.abs().max().clamp(min=1e-8)
+                codebook = self.codebook #/ self.codebook.abs().max().clamp(min=1e-8)
                 if self.use_exp_for_scale:
                     scale = self.scale.exp()
                 else:
@@ -365,14 +376,10 @@ class CodebookLoRASTELinear(nn.Module):
                     best_loss = loss.item()
                     best_codebook = self.codebook.data.clone()
                     best_scale = self.scale.data.clone()
-                    best_indexes = self.indexes.clone()
-            if (i + 1) % index_update_interval == 0:
-                self.update_indexes()
 
         with torch.no_grad():
             self.codebook.data.copy_(best_codebook)
             self.scale.data.copy_(best_scale)
-            self.indexes = best_indexes
 
         optimizer.zero_grad()
         cleanup()
@@ -381,47 +388,6 @@ class CodebookLoRASTELinear(nn.Module):
         self.orig_layer.to("cpu")
         return best_loss
 
-    # ------------------------------------------------------------------
-    # SVD-based LoRA initialisation from quantization error
-    # ------------------------------------------------------------------
-
-    @torch.no_grad()
-    def _svd_lora_init(self):
-        """Initialise LoRA A/B from a rank-r SVD of the quantization error.
-
-        After ``_mse_init`` has optimised codebook/scale/indexes, compute the
-        residual ``E = W_orig - W_quantized`` and factorise it as
-        ``U @ diag(S) @ V^T``.  Then set::
-
-            lora_B = U_r @ diag(sqrt(S_r)) * sqrt(rank / alpha)
-            lora_A = diag(sqrt(S_r)) @ V_r^T * sqrt(rank / alpha)
-
-        so that ``B @ A * (alpha / rank) ≈ E`` (best rank-r approximation).
-        This gives the optimiser a head start: LoRA already compensates for
-        most of the quantization error from the very first training step.
-        """
-        device = self.codebook.device
-        self.orig_layer.to(device)
-        orig_weight = self.orig_layer.weight.data.to(device)
-
-        # Current hard-quantized weight (no LoRA contribution)
-        quant_weight = self._dequantize_hard()
-
-        error = 0.01 * (orig_weight - quant_weight)  # (out, in)
-
-        # Truncated SVD — compute in float32 for numerical stability
-        U, S, Vh = torch.linalg.svd(error.float(), full_matrices=False)
-
-        r = self.lora_rank
-        # sqrt(S_r) split between A and B
-        sqrt_S = S[:r].sqrt()
-        # Scale factor so that B @ A * (alpha / rank) = U_r S_r V_r^T
-        inv_scale = (self.lora_rank / self.lora_alpha) ** 0.5
-
-        self.lora_B.data = (U[:, :r] * sqrt_S.unsqueeze(0) * inv_scale).to(self.lora_B.dtype)
-        self.lora_A.data = (sqrt_S.unsqueeze(1) * Vh[:r, :] * inv_scale).to(self.lora_A.dtype)
-
-        self.orig_layer.to("cpu")
 
     # ------------------------------------------------------------------
     # Dequantisation variants
@@ -429,24 +395,13 @@ class CodebookLoRASTELinear(nn.Module):
 
     def _dequantize_hard(self):
         """Standard hard dequantisation (one-hot from stored indexes)."""
-        codebook = self.codebook / self.codebook.abs().max().clamp(min=1e-8)
+        codebook = self.codebook #/ self.codebook.abs().max().clamp(min=1e-8)
         
-        if codebook.device == torch.device('cpu'):
-            one_hot = F.one_hot(
-                self.indexes.long(), num_classes=2 ** self.n_bits
-            ).to(self.codebook.device, self.codebook.dtype)
-        else:
-            with torch.cuda.device(codebook.device):
-                one_hot = one_hot_uint8_impl(
-                    self.indexes, num_classes=2 ** self.n_bits, dtype=self.codebook.dtype
-                ).to(self.codebook.device)
+        normalized = self._get_normalized_weights(differentiable=False)
         
-        weight = (codebook * one_hot).sum(dim=-1)
-
-        if self.use_exp_for_scale:
-            weight = weight * self.scale.exp()
-        else:
-            weight = weight * self.scale
+        weight = self.dequantize_by_distance(codebook, normalized)
+        
+        weight = weight * (self.scale.exp() if self.use_exp_for_scale else self.scale)
 
         out_features, in_features = self.orig_layer.weight.shape
         return weight.view(out_features, in_features)
@@ -464,69 +419,17 @@ class CodebookLoRASTELinear(nn.Module):
            ``self.codebook`` (the training function handles this).
         """
         out_features, in_features = self.orig_layer.weight.shape
-        # if self.n_bits > 2 or max(out_features, in_features) > 4096 or True:
-        #     return _checkpoint(
-        #         _ste_recompute_fn,
-        #         self.codebook,
-        #         self.scale,
-        #         self.lora_B,
-        #         self.lora_A,
-        #         self.orig_layer.weight.data.to(self.codebook.device),
-        #         self.indexes,
-        #         self.group_size,
-        #         self.n_bits,
-        #         self.use_exp_for_scale,
-        #         self.ste_temperature,
-        #         self.lora_alpha,
-        #         self.lora_rank,
-        #         out_features,
-        #         in_features,
-        #         use_reentrant=False,
-        #     )
 
-        codebook = self.codebook / self.codebook.abs().max().clamp(min=1e-8)
+        codebook = self.codebook #/ self.codebook.abs().max().clamp(min=1e-8)
 
-        # Use orig_weight + LoRA delta as the reference weight
-        effective_weight = self._get_effective_weight()
-        effective_weight_grouped = effective_weight.view(
-            out_features, in_features // self.group_size, self.group_size
-        )
-
-        # Gradient flows through scale and LoRA here
-        if self.use_exp_for_scale:
-            scale = self.scale.exp()
-        else:
-            scale = self.scale
-        iscale = get_reciprocal(scale)
-        normalized = effective_weight_grouped * iscale
-
-        # Soft assignment (differentiable w.r.t. codebook, scale, and LoRA)
-        neg_dist_sq = -(normalized.unsqueeze(-1) - codebook).pow(2) / self.ste_temperature
-        soft_assignment = F.softmax(neg_dist_sq, dim=-1)
-
-        # Hard assignment (detached)
-        # hard_assignment = F.one_hot(
-        #     self.indexes.long(), num_classes=2 ** self.n_bits
-        # ).to(self.codebook.device, self.codebook.dtype)
+        normalized = self._get_normalized_weights(differentiable=True)
         
-        with torch.cuda.device(codebook.device):
-            hard_assignment = one_hot_uint8_impl(
-                self.indexes, num_classes=2 ** self.n_bits, dtype=self.codebook.dtype
-            ).to(self.codebook.device)
+        weight = self.dequantize_by_distance(codebook, normalized)
 
-        # STE trick: forward value = hard, backward gradient = soft
-        assignment = hard_assignment + (soft_assignment - soft_assignment.detach())
+        weight = weight * (self.scale.exp() if self.use_exp_for_scale else self.scale)
 
-        weight = (codebook * assignment).sum(dim=-1) * scale
         return weight.view(out_features, in_features)
 
-    # ------------------------------------------------------------------
-    # LoRA
-    # ------------------------------------------------------------------
-
-    def _lora_weight(self):
-        """Compute LoRA correction ``B @ A * (alpha / rank)``."""
-        return (self.lora_B @ self.lora_A) * (self.lora_alpha / self.lora_rank)
 
     @torch.no_grad()
     def merge_lora(self):
@@ -546,17 +449,21 @@ class CodebookLoRASTELinear(nn.Module):
 
         # 1. Compute merged fp weight and write it back
         self.orig_layer.to(device)
-        lora_delta = (self.lora_B @ self.lora_A) * (self.lora_alpha / self.lora_rank)
+        
+        if self.lora_rank > 0:
+            lora_delta = (self.lora_B @ self.lora_A) * (self.lora_alpha / self.lora_rank)
+        else:
+            lora_delta = self.lora
         self.orig_layer.weight.data = (
             self.orig_layer.weight.data.to(device) + lora_delta
         ).to(self.orig_layer.weight.dtype)
 
         # 2. Zero out LoRA so _get_effective_weight() == orig_weight
-        self.lora_B.data.zero_()
-        self.lora_A.data.zero_()
-
-        # 3. Final index snap (codebook/scale are already trained for this weight)
-        self.update_indexes()
+        if self.lora_rank > 0:
+            self.lora_A.data.zero_()
+            self.lora_B.data.zero_()
+        else:
+            self.lora.data.zero_()
 
         # Move orig weight back to CPU to save VRAM
         self.orig_layer.to("cpu")
@@ -595,24 +502,30 @@ class CodebookLoRASTELinear(nn.Module):
         return self._dequantize_hard()
     
     @torch.no_grad()
-    def get_compressed_indexes(self):
+    def get_compressed_indexes_and_normalized_codebook(self):
+        codebook = self.codebook #/ self.codebook.abs().max().clamp(min=1e-8)
+        normalized = self._get_normalized_weights(differentiable=False)
+        indexes = self.dequantize_by_distance(codebook, normalized, return_indexes=True)
+
+        indexes = indexes.to(torch.uint8)
         if self.n_bits == 2:
-            packed = pack_2bit(self.indexes)
+            packed = pack_2bit(indexes)
         elif self.n_bits == 4:
-            packed = pack_4bit(self.indexes)
+            packed = pack_4bit(indexes)
         else:
             raise ValueError("Unsupported n_bits for packing indexes")
-        return packed
+        return packed, codebook
 
 
     @torch.no_grad()
     def get_state_dict(self):
         """Return a state dict containing just the codebook, scale, and indexes."""
+        codebook, indexes = self.get_compressed_indexes_and_normalized_codebook()
         return {
-            "codebook": self.codebook.data.cpu(),
-            "scale": self.scale.data.cpu(),
+            "codebook": codebook.cpu(),
+            "scale": (self.scale.exp() if self.use_exp_for_scale else self.scale).data.cpu(),
             "shape": self.orig_layer.weight.shape,
-            "indexes": self.get_compressed_indexes().cpu(),
+            "indexes": indexes.cpu(),
         }
 
 
@@ -631,6 +544,33 @@ def save_codebook_layers(model: nn.Module, output_dir: Path):
     torch.save(codebook_state_dict, output_dir / "codebook_layers.pth")
     print(f"Codebook layers saved to {output_dir / 'codebook_layers.pth'}")
 
+
+def dequantize_from_dict(state_dict: dict, device: torch.device) -> Tensor:
+    # dequantize weight from codebook, scale, and indexes in state_dict
+    # {
+    #     "codebook": self.codebook.data.cpu(),
+    #     "scale": self.scale.data.cpu(),
+    #     "shape": self.orig_layer.weight.shape,
+    #     "indexes": self.get_compressed_indexes().cpu(),
+    # }
+    codebook = state_dict["codebook"].to(device)
+    scale = state_dict["scale"].to(device)
+    shape = state_dict["shape"]
+    indexes = state_dict["indexes"].to(device)
+    
+    
+    if indexes.dtype == torch.uint8 and codebook.shape[0] == 16:
+        indexes = unpack_4bit(indexes)
+    elif indexes.dtype == torch.uint8 and codebook.shape[0] == 4:
+        indexes = unpack_2bit(indexes)
+
+    weight = codebook[indexes.flatten().long()].reshape(indexes.shape)
+    weight = weight * scale
+
+    out_features, in_features = shape
+    return weight.view(out_features, in_features)
+    
+    
 
 # ---------------------------------------------------------------------------
 # Wrap / unwrap helpers
@@ -666,7 +606,7 @@ def wrap_model_block_ste(
                 changed_modules[name] = module
 
     for name, module in changed_modules.items():
-        #print(f"  Wrapping {name} with CodebookLoRASTELinear 2bit (rank={lora_rank}, group_size={group_size})")
+        #print(f"  Wrapping {name} with CodebookLoRASTELinear 2bit (rank={-1}, group_size={group_size})")
         set_module(
             block,
             name,
@@ -681,7 +621,7 @@ def wrap_model_block_ste(
     cleanup()
     
     for name, module in changed_modules_4_bit.items():
-        #print(f"  Wrapping {name} with CodebookLoRASTELinear 4bit (rank={lora_rank}, group_size={2 * group_size})")
+        #print(f"  Wrapping {name} with CodebookLoRASTELinear 4bit (rank={lora_rank // 2}, group_size={2 * group_size})")
         set_module(
             block,
             name,
@@ -693,12 +633,12 @@ def wrap_model_block_ste(
                 group_size=2 * group_size,
             ),
         )
+    cleanup()
     
     for name, module in block.named_modules():
         if isinstance(module, CodebookLoRASTELinear):
             print(f"  Wrapped {name} with CodebookLoRASTELinear (n_bits={module.n_bits}, lora_rank={module.lora_rank}, group_size={module.group_size})")
-    cleanup()
-
+        
     return block
 
 
@@ -761,7 +701,7 @@ def finetune_layer_ste(
     ste_temp_end: float = 0.01,
     index_update_epochs: int = 4,
     keep_data_on_cpu: bool = True,
-    warm_up_for_scale_and_lora: bool = False,
+    warm_up_codebook_epochs: int = 4,
 ) -> nn.Module:
     """Fine-tune a single transformer block using STE + LoRA with L2 loss.
 
@@ -792,8 +732,9 @@ def finetune_layer_ste(
     scales: list[nn.Parameter] = []
     lora_params: list[nn.Parameter] = []
     
-    
-    layer = torch.compile(layer)
+    # lead to NaN in one A100 GPU
+    if torch.cuda.device_count() > 1:
+        layer = torch.compile(layer)
 
     for name, param in layer.named_parameters():
         if "codebook" in name:
@@ -811,8 +752,7 @@ def finetune_layer_ste(
     param_groups = [
         {"params": codebooks, "lr": lr, "label": "codebook"},
         {"params": scales, "lr": 10 * lr, "label": "scale"},
-        #{"params": lora_params, "lr": lora_lr, "label": "lora"},
-        {"params": lora_params, "lr": lora_lr, "label": "lora"},
+        {"params": lora_params, "lr": 0.1 * lora_lr, "label": "lora"},
     ]
     # Drop empty groups
     param_groups = [g for g in param_groups if g["params"]]
@@ -845,96 +785,7 @@ def finetune_layer_ste(
     epoch_samples = num_samples - num_samples % microbatch_size
     microbatches_per_epoch = epoch_samples // microbatch_size
     total_opt_steps = epochs_per_layer * epoch_samples // batch_size
-
-    if warm_up_for_scale_and_lora:
-        wup_epochs = 2
-        total_wup_opt_steps = wup_epochs * epoch_samples // batch_size
-        
-        print(f"  Warming up scale and LoRA parameters for 1 epoch with STE temperature {ste_temp_start}...")
-        opt_warmup = torch.optim.AdamW(
-            [p for g in param_groups for p in g["params"] if g["label"] in ("scale", "lora")],
-            lr=lr,
-            weight_decay=0.01,
-        )
-        codebook_params = [p for g in param_groups for p in g["params"] if g["label"] == "codebook"]
-        for p in codebook_params:
-            p.requires_grad = False
-
-        
-        for m in ste_modules:
-            m.ste_temperature = ste_temp_start
-        
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt_warmup, eta_min=lr * 1e-4, T_max=total_wup_opt_steps)
-        
-        global_step = 0
-        
-        for _ in range(wup_epochs):
-            batch_indices_epoch = torch.randperm(num_samples)[:epoch_samples].chunk(microbatches_per_epoch)
-            grad_steps = 0
-            loss_numerator = 0.0
-            loss_denominator = 0.0
-        
-
-            for indices in track(
-                batch_indices_epoch,
-                description=f"    Warm-up epoch",
-            ):
-                indices = indices.tolist()
-                hidden, kwargs = collate_fn(fp_inputs, indices, device=device)
-                hidden = hidden.to(device)
-                layer_outputs = layer(hidden, **kwargs)
-                orig_output = torch.cat([fp_outputs[i] for i in indices], dim=0).to(device)
-                loss = F.mse_loss(layer_outputs, orig_output.to(dtype=layer_outputs.dtype))
-                
-                loss_numerator += loss.detach().item()
-                loss_denominator += torch.mean(orig_output ** 2).detach().item()
-
-                (loss / grad_accumulation_steps).backward()
-                grad_steps += 1
-                
-                if grad_steps == grad_accumulation_steps:
-                    for group in param_groups:
-                        torch.nn.utils.clip_grad_norm_(group["params"], 1.0)
-                    grad_steps = 0
-                    opt_warmup.step()
-                    scheduler.step()
-                    for m in ste_modules:
-                        m.update_indexes()
-                    
-                    rel_loss = loss_numerator / max(loss_denominator, 1e-8)
-                    agg_loss = loss_numerator / grad_accumulation_steps
-                    loss_numerator = loss_denominator = grad_steps = 0
-
-                    if tb is not None:
-                        tb.add_scalar(f"warmup_rel_loss/layer_{layer_idx}", rel_loss, global_step)
-                        tb.add_scalar(f"warmup_ste_loss/layer_{layer_idx}", agg_loss, global_step)
-                        log_gradients_in_model(layer, tb, -global_step, layer_idx)
-                    global_step += 1
-                    opt_warmup.zero_grad()
-
-        opt_warmup.zero_grad()
-        del opt_warmup
-        for p in codebook_params:
-            p.requires_grad = True
-
-    # ------------------------------------------------------------------
-    # Training bookkeeping
-    # ------------------------------------------------------------------
-
-    opt = torch.optim.AdamW(param_groups, weight_decay=0.01)
-
-    # LR schedule: constant during index-update phase, then linear decay
-    warmup_steps = index_update_epochs * epoch_samples // batch_size
-
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return 1.0
-        remaining = total_opt_steps - warmup_steps
-        if remaining <= 0:
-            return 1.0
-        return max(1e-4, 1.0 - (step - warmup_steps) / remaining)
-
-    #scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
+    opt = torch.optim.AdamW(param_groups)#, weight_decay=0.01)
     
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, eta_min=lr * 1e-4, T_max=total_opt_steps)
 
@@ -943,6 +794,12 @@ def finetune_layer_ste(
     # ------------------------------------------------------------------
     global_step = 0
 
+    # compute graient clipping exponent based on total steps and desired final max norm
+    final_max_norm = 0.1
+    start_max_norm = 1.0
+    max_norm_decay = (final_max_norm / start_max_norm) ** (1 / max(total_opt_steps - 1, 1))
+    codebook_gradient_max_value = 0.01
+    
     for epoch in range(epochs_per_layer):
         opt.zero_grad()
         batch_indices_epoch = torch.randperm(num_samples)[:epoch_samples].chunk(microbatches_per_epoch)
@@ -950,7 +807,7 @@ def finetune_layer_ste(
         num_batches = 0
         loss_numerator = grad_steps = 0
         loss_denominator = 0.0
-        max_norm = 1.0 #0.98**epoch
+        max_norm = start_max_norm * (max_norm_decay ** epoch)
         
 
         # Anneal STE temperature
@@ -971,10 +828,10 @@ def finetune_layer_ste(
             layer_outputs = layer(hidden, **kwargs)
             orig_output = torch.cat([fp_outputs[i] for i in indices], dim=0).to(device)
 
-            #loss = F.mse_loss(layer_outputs, orig_output.to(dtype=layer_outputs.dtype))
+            loss = F.mse_loss(layer_outputs, orig_output.to(dtype=layer_outputs.dtype))
 
-            _, mask = get_abs_top_percent_mask(torch.abs(layer_outputs - orig_output))  # This will update the mask used in the forward pass of CodebookWrapperLinear for the next iteration
-            loss = torch.mean(((layer_outputs - orig_output.to(dtype=layer_outputs.dtype)) * mask)**2)
+            # _, mask = get_abs_top_percent_mask(torch.abs(layer_outputs - orig_output))  # This will update the mask used in the forward pass of CodebookWrapperLinear for the next iteration
+            # loss = torch.mean(((layer_outputs - orig_output.to(dtype=layer_outputs.dtype)) * mask)**2)
 
             if not torch.isfinite(loss).item():
                 raise ValueError(
@@ -993,15 +850,12 @@ def finetune_layer_ste(
                 for group in param_groups:
                     torch.nn.utils.clip_grad_norm_(group["params"], max_norm)
                 
-                torch.nn.utils.clip_grad_value_(codebooks, 0.01)
+                for group in param_groups:
+                    if group["label"] == "codebook":
+                        torch.nn.utils.clip_grad_value_(group["params"], codebook_gradient_max_value)
 
                 opt.step()
                 scheduler.step()
-
-                # Refresh indexes during early (exploratory) epochs
-                if epoch < index_update_epochs * 10000:
-                    for m in ste_modules:
-                        m.update_indexes()
 
                 rel_loss = loss_numerator / max(loss_denominator, 1e-8)
                 agg_loss = loss_numerator / grad_steps
@@ -1029,12 +883,19 @@ def finetune_layer_ste(
     print(f"  Merging LoRA into codebook representation ...")
     for m in ste_modules:
         m.training_mode_ste = False
-        #m.check_hard_and_ste_consistency()
+        m.check_hard_and_ste_consistency()
         m.merge_lora()
 
     del opt, scheduler
     cleanup()
     
+    for p in lora_params:
+        p.requires_grad = False
+    for p in scales:
+        p.requires_grad = False
+    for p in codebooks:
+        p.requires_grad = False
+
     if hasattr(layer, "_orig_mod"):
         layer = layer._orig_mod
 
@@ -1235,7 +1096,7 @@ def finetune_layerwise_ste(
             layer_idx=layer_idx,
             lr=lr,
             lora_lr=lora_lr,
-            epochs_per_layer=epochs_per_layer + min(layer_idx, 15),
+            epochs_per_layer=epochs_per_layer + min(layer_idx, 15),  # optional: increase epochs for deeper layers
             batch_size=batch_size,
             microbatch_size=microbatch_size,
             device=device,
