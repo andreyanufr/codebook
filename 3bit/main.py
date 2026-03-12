@@ -548,7 +548,7 @@ def main(argv) -> float:
                     if p.grad is not None:
                         grad_norm = p.grad.data.norm().item()
                         moving_average_gradient_norm[i] = alpha * moving_average_gradient_norm[i] + (1 - alpha) * grad_norm
-                        adaptive_clip_value = max(0.00000001, moving_average_gradient_norm[i])
+                        adaptive_clip_value = min(0.01, moving_average_gradient_norm[i])
                         torch.nn.utils.clip_grad_value_([p], adaptive_clip_value)
 
                 opt.step()
