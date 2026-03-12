@@ -328,11 +328,15 @@ class CodebookLoRASTELinear(nn.Module):
     # Dequantisation variants
     # ------------------------------------------------------------------
 
+    def get_codebook(self):
+        return self.codebook / self.codebook.abs().max().clamp(min=1e-8)
+
+
     def _dequantize_hard(self):
         """Standard hard dequantisation (one-hot from stored indexes)."""
         
         normalized = self._get_normalized_weights(differentiable=False)
-        weight = self.dequantize_by_distance(self.codebook, normalized)
+        weight = self.dequantize_by_distance(self.get_codebook(), normalized)
         weight = weight  * (self.scale.exp() if self.use_exp_for_scale else self.scale)
         return weight.view(self.orig_layer.weight.shape)
 
@@ -349,7 +353,7 @@ class CodebookLoRASTELinear(nn.Module):
            ``self.codebook`` (the training function handles this).
         """
         normalized = self._get_normalized_weights(differentiable=True)
-        weight = self.dequantize_by_distance(self.codebook, normalized)
+        weight = self.dequantize_by_distance(self.get_codebook(), normalized)
         weight = weight  * (self.scale.exp() if self.use_exp_for_scale else self.scale)
         return weight.view(self.orig_layer.weight.shape)
 
@@ -427,7 +431,7 @@ class CodebookLoRASTELinear(nn.Module):
     @torch.no_grad()
     def get_compressed_indexes(self):
         normalized = self._get_normalized_weights(differentiable=False)
-        indexes = self.dequantize_by_distance(self.codebook, normalized, return_indexes=True)
+        indexes = self.dequantize_by_distance(self.get_codebook(), normalized, return_indexes=True)
         indexes = indexes.to(torch.uint8)
         
         if self.n_bits == 2:
@@ -443,7 +447,7 @@ class CodebookLoRASTELinear(nn.Module):
     def get_state_dict(self):
         """Return a state dict containing just the codebook, scale, and indexes."""
         return {
-            "codebook": self.codebook.data.cpu(),
+            "codebook": self.get_codebook().data.cpu(),
             "scale": (self.scale.exp() if self.use_exp_for_scale else self.scale).data.cpu(),
             "shape": self.orig_layer.weight.shape,
             "indexes": self.get_compressed_indexes().cpu(),
@@ -644,7 +648,7 @@ def finetune_layer_ste(
             param.requires_grad = False
 
     param_groups = [
-        {"params": scales, "lr": lr, "label": "scale"},
+        {"params": scales, "lr": 10 * lr, "label": "scale"},
         {"params": lora_params, "lr": 0.1 * lora_lr, "label": "lora"},
         {"params": codebooks, "lr": lr, "label": "codebook"},
     ]
@@ -698,7 +702,7 @@ def finetune_layer_ste(
         return max(1e-4, 1.0 - (step - warmup_steps) / remaining)
 
     #scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
-    
+    #total_opt_steps = epochs_per_layer * epoch_samples // batch_size
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, eta_min=lr * 1e-4, T_max=total_opt_steps)
 
     # ------------------------------------------------------------------

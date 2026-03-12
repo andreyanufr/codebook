@@ -108,7 +108,7 @@ class BlockInputCacher(nn.Module):
 
 
 @torch.no_grad()
-def get_first_block_inputs(model: nn.Module, dataset: list[Tensor]):
+def get_first_block_inputs(model: nn.Module, dataset: list[Tensor], only_one_batch: bool = False):
     model.eval()
     
     model.model.layers[0] = BlockInputCacher(model.model.layers[0], name="layer_0")
@@ -116,7 +116,9 @@ def get_first_block_inputs(model: nn.Module, dataset: list[Tensor]):
     with torch.no_grad():
         for batch in track(dataset, description="Caching block inputs..."):
             model(batch)
-    
+            if only_one_batch:
+                break
+
     # After running through the dataset, dump the cached inputs for each block
     res = model.model.layers[0].cached_inputs
 

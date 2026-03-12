@@ -526,7 +526,7 @@ def dequantize_from_dict(state_dict: dict, device: torch.device) -> Tensor:
     indexes = state_dict["indexes"].to(device)
     
     
-    if indexes.dtype == torch.uint8 and codebook.shape[0] == 16:
+    if indexes.dtype == torch.uint8 and (codebook.shape[0] == 16 or codebook.shape[0] == 8): # 4 and 3 bit
         indexes = unpack_4bit(indexes)
     elif indexes.dtype == torch.uint8 and codebook.shape[0] == 4:
         indexes = unpack_2bit(indexes)
@@ -537,7 +537,7 @@ def dequantize_from_dict(state_dict: dict, device: torch.device) -> Tensor:
     ).to(codebook.device, codebook.dtype)
 
     weight = (codebook * one_hot).sum(dim=-1)
-    weight = weight * scale.exp()
+    weight = weight * scale
 
     out_features, in_features = shape
     return weight.view(out_features, in_features)

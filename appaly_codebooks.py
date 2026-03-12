@@ -40,7 +40,7 @@ def get_argument_parser() -> argparse.ArgumentParser:
     
     return parser
 
-
+# main.py --pretrained Qwen/Qwen3-4B --codebooks_path /home/aanuf/proj/learnable_codebooks/3bit/qwen3_4B/STE_LORA_512_1024_samples_20_plus_epoch_90bs_adam_no_exp_scale_diff_lr_last/codebook_layers.pth --output_dir /home/aanuf/proj/learnable_codebooks/3bit/qwen3_4B/STE_LORA_512_1024_samples_20_plus_epoch_90bs_adam_no_exp_scale_diff_lr_last/tmp/
 def main(argv):
     parser = get_argument_parser()
     args = parser.parse_args(argv)

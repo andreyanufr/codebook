@@ -44,6 +44,7 @@ See finetune_layerwise_l2() function for programmatic API usage.
 """
 
 import argparse
+import math
 import shutil
 import sys
 import warnings
@@ -71,7 +72,7 @@ from nncf.common.logging.track_progress import track
 
 from utils import cleanup
 from train_layerwise import finetune_layerwise_ste
-from train_layerwise import wrap_model_ste, unwrap_model_ste, CodebookLoRASTELinear, save_codebook_layers
+from train_layerwise import wrap_model_ste, unwrap_model_ste, CodebookLoRASTELinear, save_codebook_layers, log_gradients_in_model
 
 def save_codebook_layers(model: nn.Module, output_dir: Path):
     """
@@ -437,7 +438,7 @@ def main(argv) -> float:
                                batch_size=args.batch_size,
                                microbatch_size=args.microbatch_size,
                                device=device, tb=tb, 
-                               lora_rank=1024, group_size=32 if '1B' in args.pretrained else 64,
+                               lora_rank=512, group_size=32 if '1B' in args.pretrained else 64,
                                codebook_dst_dir=last_dir,
                                keep_data_on_cpu=args.keep_data_on_cpu,
                                num_bits=args.num_bits)
@@ -470,14 +471,13 @@ def main(argv) -> float:
     
 
     scales_params, codebook_params, lora_params = set_trainable(model)
-    opt = torch.optim.AdamW([
-        {"params": scales_params, "lr": 10 * args.lr},
-        {"params": codebook_params, "lr": args.lr},
-        {"params": lora_params, "lr": 0.1 * args.lr},
-    ])
 
-    # lambda_lr = lambda epoch: 0.99 ** epoch
-    # scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lambda_lr)
+    # Two optimizers: one for codebooks (even epochs), one for scales+lora (odd epochs)
+    opt_codebook = torch.optim.AdamW(codebook_params, lr=0.1 * args.lr)
+    opt_scales_lora = torch.optim.AdamW([
+        {"params": scales_params, "lr": args.lr},
+        {"params": lora_params, "lr": args.lr},
+    ])
 
     # Run tuning with distillation loss and validation after each epoch.
     grad_accumulation_steps = args.batch_size // args.microbatch_size
@@ -491,13 +491,51 @@ def main(argv) -> float:
         if isinstance(module, CodebookLoRASTELinear):
             ste_modules.append(module)
 
+    # One cosine scheduler shared across both optimizers
     total_opt_steps = args.epochs * epoch_samples // args.batch_size
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, eta_min=args.lr * 1e-4, T_max=total_opt_steps)
+    eta_min_ratio = 1e-4
+    initial_lrs = {
+        "codebook": [g["lr"] for g in opt_codebook.param_groups],
+        "scales_lora": [g["lr"] for g in opt_scales_lora.param_groups],
+    }
+    scheduler_step_count = 0
+
+    def scheduler_step():
+        nonlocal scheduler_step_count
+        scheduler_step_count += 1
+        factor = eta_min_ratio + (1 - eta_min_ratio) * (1 + math.cos(math.pi * scheduler_step_count / total_opt_steps)) / 2
+        for group, init_lr in zip(opt_codebook.param_groups, initial_lrs["codebook"]):
+            group["lr"] = init_lr * factor
+        for group, init_lr in zip(opt_scales_lora.param_groups, initial_lrs["scales_lora"]):
+            group["lr"] = init_lr * factor
+
+    moving_average_gradient_norm = [0.0001 for _ in codebook_params + scales_params + lora_params]
+    alpha = 0.99
 
     for epoch in range(args.epochs):
+        # Odd epochs: train codebooks only; even epochs: train scales and loras only
+        if epoch % 2 == 0:
+            for p in codebook_params:
+                p.requires_grad = True
+            for p in scales_params:
+                p.requires_grad = False
+            for p in lora_params:
+                p.requires_grad = False
+            active_opt = opt_codebook
+            epoch_tag = "codebooks"
+        else:
+            for p in codebook_params:
+                p.requires_grad = False
+            for p in scales_params:
+                p.requires_grad = True
+            for p in lora_params:
+                p.requires_grad = True
+            active_opt = opt_scales_lora
+            epoch_tag = "scales+lora"
+
         batch_indices_epoch = torch.randperm(num_samples)[:epoch_samples].chunk(microbatches_per_epoch)
 
-        for indices in track(batch_indices_epoch, description=f"Train epoch {epoch}"):
+        for indices in track(batch_indices_epoch, description=f"Train epoch {epoch} [{epoch_tag}]"):
             indices = indices.tolist()
 
             def form_batch(inputs: list[Tensor], model_input: bool):
@@ -525,15 +563,32 @@ def main(argv) -> float:
                 raise ValueError(err)
             (loss / grad_accumulation_steps).backward()
             if grad_steps == grad_accumulation_steps:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step()
-                opt.zero_grad()
+                # if epoch_tag == "codebooks":
+                #     # for codebooks restrict changes by the 0.1 of mean distance between codebook values
+                #     for p in codebook_params:
+                #         with torch.no_grad():
+                #             cb_vals = p.data.view(-1)
+                #             dist = torch.mean(torch.abs(cb_vals[:, None] - cb_vals[None, :])).item()
+                #             torch.nn.utils.clip_grad_norm_([p], max_norm=0.01 * dist)
+                # else:
+                #     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                
+                for i, p in enumerate(codebook_params + scales_params + lora_params):
+                    if p.grad is not None:
+                        grad_norm = p.grad.data.norm().item()
+                        moving_average_gradient_norm[i] = alpha * moving_average_gradient_norm[i] + (1 - alpha) * grad_norm
+                        adaptive_clip_value = max(0.00000001, moving_average_gradient_norm[i])
+                        torch.nn.utils.clip_grad_value_([p], adaptive_clip_value)
+
+                active_opt.step()
+                active_opt.zero_grad()
                 
                 aggregated_loss = loss_numerator / grad_steps
                 loss_numerator = grad_steps = 0
                 total_steps += 1
                 tb.add_scalar("loss", aggregated_loss, total_steps)
-                tb.add_scalar("lr", opt.param_groups[0]["lr"], total_steps)
+                tb.add_scalar("lr", active_opt.param_groups[0]["lr"], total_steps)
+                log_gradients_in_model(layer, tb, global_step, layer_idx)
 
                 for m in ste_modules:
                     if hasattr(m, "update_indexes"):
@@ -543,7 +598,7 @@ def main(argv) -> float:
                     print(f"Early stopping at epoch {epoch} with loss {aggregated_loss:.6f}")
                     break
 
-                scheduler.step()
+                scheduler_step()
 
     save_codebook_layers(model, last_dir)
     model = unwrap_model_ste(model)
