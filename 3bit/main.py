@@ -588,7 +588,7 @@ def main(argv) -> float:
                 total_steps += 1
                 tb.add_scalar("loss", aggregated_loss, total_steps)
                 tb.add_scalar("lr", active_opt.param_groups[0]["lr"], total_steps)
-                log_gradients_in_model(layer, tb, global_step, layer_idx)
+                log_gradients_in_model(model, tb, total_steps, "all")
 
                 for m in ste_modules:
                     if hasattr(m, "update_indexes"):
