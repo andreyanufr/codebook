@@ -685,9 +685,12 @@ class CodebookLoRASTELinear(nn.Module):
             return self.orig_layer.weight.data.detach()
 
         if self.use_exp_for_lora:
-            return self.orig_layer.weight.data.to(self.codebook.device) /  torch.exp(self.lora_B @ self.lora_A + self.lora_c + self.lora_r)
+            exponent = self.lora_B @ self.lora_A + self.lora_c + self.lora_r
+            # Clamp to prevent overflow (exp(10) ~ 22026 in bf16 range)
+            exponent = exponent.clamp(-10.0, 10.0)
+            return self.orig_layer.weight.data.to(self.codebook.device) / torch.exp(exponent)
         else:
-            return self.orig_layer.weight.data.to(self.codebook.device)  + (self.lora_B @ self.lora_A + self.lora_c + self.lora_r) * (self.lora_alpha / self.lora_rank)
+            return self.orig_layer.weight.data.to(self.codebook.device) + (self.lora_B @ self.lora_A + self.lora_c + self.lora_r) * (self.lora_alpha / self.lora_rank)
 
 
 
@@ -731,14 +734,14 @@ class CodebookLoRASTELinear(nn.Module):
 
         if differentiable:
             if self.use_exp_for_scale:
-                iscale = get_reciprocal(self.scale.exp())
+                iscale = get_reciprocal(self.scale.clamp(-20.0, 20.0).exp())
             else:
                 iscale = get_reciprocal(self.scale)
             return weight * iscale
         else:
             with torch.no_grad():
                 if self.use_exp_for_scale:
-                    iscale = get_reciprocal(self.scale.exp())
+                    iscale = get_reciprocal(self.scale.clamp(-20.0, 20.0).exp())
                 else:
                     iscale = get_reciprocal(self.scale)
                 return weight * iscale
@@ -826,14 +829,16 @@ class CodebookLoRASTELinear(nn.Module):
         
         normalized = self._get_normalized_weights(differentiable=False)
         weight = self.dequantize_by_distance(self.get_codebook(), normalized)
-        weight = weight  * (self.scale.exp() if self.use_exp_for_scale else self.scale)
+        scale = self.scale.clamp(-20.0, 20.0).exp() if self.use_exp_for_scale else self.scale
+        weight = weight * scale
         return weight.view(self.orig_layer.weight.shape)
 
     def _dequantize_ste_impl(self):
         """Core STE dequantisation logic (may be wrapped by checkpoint)."""
         normalized = self._get_normalized_weights(differentiable=True)
         weight = self.dequantize_by_distance(self.get_codebook(), normalized)
-        weight = weight  * (self.scale.exp() if self.use_exp_for_scale else self.scale)
+        scale = self.scale.clamp(-20.0, 20.0).exp() if self.use_exp_for_scale else self.scale
+        weight = weight * scale
         return weight.view(self.orig_layer.weight.shape)
 
     def _dequantize_ste(self):
@@ -947,7 +952,7 @@ class CodebookLoRASTELinear(nn.Module):
         """Return a state dict containing just the codebook, scale, and indexes."""
         return {
             "codebook": self.get_codebook().data.cpu(),
-            "scale": (self.scale.exp() if self.use_exp_for_scale else self.scale).data.cpu(),
+            "scale": (self.scale.clamp(-20.0, 20.0).exp() if self.use_exp_for_scale else self.scale).data.cpu(),
             "shape": self.orig_layer.weight.shape,
             "indexes": self.get_compressed_indexes().cpu(),
         }
@@ -1238,9 +1243,14 @@ def finetune_layer_ste(
             loss = torch.mean(((layer_outputs - orig_output.to(dtype=layer_outputs.dtype)) * mask)**2)
 
             if not torch.isfinite(loss).item():
-                raise ValueError(
-                    f"Non-finite loss ({loss.item()}) at layer {layer_idx}, step {global_step}"
+                print(
+                    f"WARNING: Non-finite loss at layer {layer_idx}, step {global_step}. Skipping batch."
                 )
+                opt.zero_grad()
+                loss_numerator = grad_steps = 0
+                loss_denominator = 0.0
+                del hidden, layer_outputs, orig_output, loss
+                continue
 
             loss_numerator += loss.item()
             loss_denominator += torch.mean(orig_output ** 2).detach().item()

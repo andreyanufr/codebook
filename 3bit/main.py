@@ -256,9 +256,10 @@ def kl_div(student_hiddens: torch.Tensor, teacher_hiddens: torch.Tensor) -> torc
     :returns: The computed KL divergence loss.
     """
     num_classes = student_hiddens.shape[-1]
+    # Compute in float32 to avoid NaN from log_softmax on bf16 logits
     return F.kl_div(
-        input=F.log_softmax(student_hiddens.view(-1, num_classes), dim=-1),
-        target=F.log_softmax(teacher_hiddens.view(-1, num_classes), dim=-1),
+        input=F.log_softmax(student_hiddens.view(-1, num_classes).float(), dim=-1),
+        target=F.log_softmax(teacher_hiddens.view(-1, num_classes).float(), dim=-1),
         log_target=True,
         reduction="batchmean",
     )
@@ -527,11 +528,13 @@ def main(argv) -> float:
             loss = kl_div(outputs, targets.to(dtype=torch_dtype, device=device))
 
             # Perform an optimization step after accumulating gradients over multiple minibatches.
+            if not torch.isfinite(loss).item():
+                print(f"WARNING: Non-finite loss ({loss.item()}) at epoch {epoch}, step {total_steps}. Skipping batch.")
+                opt.zero_grad()
+                loss_numerator = grad_steps = 0
+                continue
             loss_numerator += loss.item()
             grad_steps += 1
-            if not torch.isfinite(loss).item():
-                err = f"Fine-tuning loss is {loss}"
-                raise ValueError(err)
             (loss / grad_accumulation_steps).backward()
             if grad_steps == grad_accumulation_steps:
                 # if epoch_tag == "codebooks":
@@ -544,22 +547,30 @@ def main(argv) -> float:
                 # else:
                 #     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 
+                # Global gradient norm clip to prevent explosion
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
                 for i, p in enumerate(codebook_params + scales_params + lora_params):
                     if p.grad is not None:
                         grad_norm = p.grad.data.norm().item()
+                        if not math.isfinite(grad_norm):
+                            print(f"WARNING: Non-finite gradient norm at step {total_steps}. Skipping update.")
+                            opt.zero_grad()
+                            loss_numerator = grad_steps = 0
+                            break
                         moving_average_gradient_norm[i] = alpha * moving_average_gradient_norm[i] + (1 - alpha) * grad_norm
                         adaptive_clip_value = min(0.01, moving_average_gradient_norm[i])
                         torch.nn.utils.clip_grad_value_([p], adaptive_clip_value)
-
-                opt.step()
+                else:
+                    opt.step()
                 
-                aggregated_loss = loss_numerator / grad_steps
-                loss_numerator = grad_steps = 0
-                total_steps += 1
-                tb.add_scalar("loss", aggregated_loss, total_steps)
-                tb.add_scalar("lr", opt.param_groups[0]["lr"], total_steps)
-                log_gradients_in_model(model, tb, total_steps, "all")
+                    aggregated_loss = loss_numerator / grad_steps
+                    total_steps += 1
+                    tb.add_scalar("loss", aggregated_loss, total_steps)
+                    tb.add_scalar("lr", opt.param_groups[0]["lr"], total_steps)
+                    log_gradients_in_model(model, tb, total_steps, "all")
 
+                loss_numerator = grad_steps = 0
                 opt.zero_grad()
                 scheduler.step()
 
