@@ -567,9 +567,10 @@ def main(argv) -> float:
                 opt.zero_grad()
                 scheduler.step()
 
-                for m in ste_modules:
-                    if hasattr(m, "update_codebook"):
-                        m.update_codebook()
+                if total_steps % (4 * grad_accumulation_steps) == 0:
+                    for m in ste_modules:
+                        if hasattr(m, "update_codebook"):
+                            m.update_codebook()
 
                 if aggregated_loss < 0.007:
                     print(f"Early stopping at epoch {epoch} with loss {aggregated_loss:.6f}")
