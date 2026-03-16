@@ -190,7 +190,7 @@ class CodebookLoRASTELinear(nn.Module):
 
     @torch.no_grad()
     def update_codebook(self, step: int = 0):
-        gen = torch.Generator(device=self.weight.device)
+        gen = torch.Generator(device=self.scale.device)
         seed = (self._ql_uid * 1_000_003 + step) & 0x7FFF_FFFF
         gen.manual_seed(seed)
         
@@ -232,7 +232,7 @@ class CodebookLoRASTELinear(nn.Module):
             scale = torch.log(scale)
 
         self.scale = nn.Parameter(scale, requires_grad=True)
-    
+
     
     def get_lora(self):
         if self.lora_rank == -1:
@@ -255,9 +255,9 @@ class CodebookLoRASTELinear(nn.Module):
         if self.use_exp_for_lora:
             # Clamp to prevent overflow (exp(10) ~ 22026 in bf16 range)
             exponent = lora.clamp(-10.0, 10.0)
-            return self.orig_layer.weight.data.to(self.codebook.device) / torch.exp(exponent)
+            return self.orig_layer.weight.data.to(lora.device) / torch.exp(exponent)
         else:
-            return self.orig_layer.weight.data.to(self.codebook.device) + lora
+            return self.orig_layer.weight.data.to(lora.device) + lora
 
 
 
@@ -273,7 +273,7 @@ class CodebookLoRASTELinear(nn.Module):
             # train only codebook
             one_hot = F.one_hot(
                 idx, num_classes=2 ** self.n_bits
-            ).to(codebook.device, codebook.dtype)
+            ).to(self.scale.device, codebook.dtype)
 
             quantized = (one_hot * codebook).sum(dim=-1)
         else:
@@ -331,7 +331,7 @@ class CodebookLoRASTELinear(nn.Module):
 
 
     def _mse_init(self, n_iters: int = 200, lr: float = 0.01):
-        device = self.codebook.device
+        device = self.scale.device
         self.orig_layer.to(device)
         orig_weight = self.orig_layer.weight.data.to(device)
 
@@ -454,7 +454,7 @@ class CodebookLoRASTELinear(nn.Module):
 
         No expensive re-quantisation loop is required.
         """
-        device = self.codebook.device
+        device = self.scale.device
 
         # 1. Compute merged fp weight and write it back
         self.orig_layer.to(device)
