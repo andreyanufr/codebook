@@ -71,8 +71,8 @@ from transformers import AutoTokenizer
 from nncf.common.logging.track_progress import track
 
 from utils import cleanup
-from train_layerwise import finetune_layerwise_ste
-from train_layerwise import wrap_model_ste, unwrap_model_ste, CodebookLoRASTELinear, save_codebook_layers, log_gradients_in_model
+from train_layerwise_kmeans import finetune_layerwise_ste
+from train_layerwise_kmeans import wrap_model_ste, unwrap_model_ste, CodebookLoRASTELinear, save_codebook_layers, log_gradients_in_model
 
 def save_codebook_layers(model: nn.Module, output_dir: Path):
     """
