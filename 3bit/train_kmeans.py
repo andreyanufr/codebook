@@ -471,11 +471,10 @@ def main(argv) -> float:
     print("="*80 + "\n")
     
 
-    scales_params, codebook_params, lora_params = set_trainable(model)
+    scales_params, _, lora_params = set_trainable(model)
 
     # Two optimizers: one for codebooks (even epochs), one for scales+lora (odd epochs)
     opt = torch.optim.AdamW([
-        {"params": codebook_params, "lr": args.lr},
         {"params": scales_params, "lr": args.lr},
         {"params": lora_params, "lr": args.lr},
     ])
@@ -497,7 +496,7 @@ def main(argv) -> float:
     eta_min_ratio = 1e-4
     scheduler_step_count = 0
 
-    moving_average_gradient_norm = [0.0001 for _ in codebook_params + scales_params + lora_params]
+    moving_average_gradient_norm = [0.0001 for _ in scales_params + lora_params]
     alpha = 0.99
     epoch_tag = "train all"
     
@@ -537,20 +536,11 @@ def main(argv) -> float:
             grad_steps += 1
             (loss / grad_accumulation_steps).backward()
             if grad_steps == grad_accumulation_steps:
-                # if epoch_tag == "codebooks":
-                #     # for codebooks restrict changes by the 0.1 of mean distance between codebook values
-                #     for p in codebook_params:
-                #         with torch.no_grad():
-                #             cb_vals = p.data.view(-1)
-                #             dist = torch.mean(torch.abs(cb_vals[:, None] - cb_vals[None, :])).item()
-                #             torch.nn.utils.clip_grad_norm_([p], max_norm=0.01 * dist)
-                # else:
-                #     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 
                 # Global gradient norm clip to prevent explosion
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-                for i, p in enumerate(codebook_params + scales_params + lora_params):
+                for i, p in enumerate(scales_params + lora_params):
                     if p.grad is not None:
                         grad_norm = p.grad.data.norm().item()
                         if not math.isfinite(grad_norm):
@@ -575,8 +565,8 @@ def main(argv) -> float:
                 scheduler.step()
 
                 for m in ste_modules:
-                    if hasattr(m, "update_indexes"):
-                        m.update_indexes()
+                    if hasattr(m, "update_codebook"):
+                        m.update_codebook()
 
                 if aggregated_loss < 0.007:
                     print(f"Early stopping at epoch {epoch} with loss {aggregated_loss:.6f}")
