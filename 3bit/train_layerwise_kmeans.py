@@ -124,6 +124,7 @@ class CodebookLoRASTELinear(nn.Module):
         # Controls whether forward uses STE (True) or hard-only (False)
         self.training_mode_ste: bool = True
         self.use_one_hot = False
+        self._ql_uid = 0
 
         out_features, in_features = orig_layer.weight.shape
         

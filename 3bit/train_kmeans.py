@@ -487,8 +487,11 @@ def main(argv) -> float:
     aggregated_loss = float("nan")
     loss_numerator = grad_steps = total_steps = 0
     ste_modules = []
+    uid = 0
     for module in model.modules():
         if isinstance(module, CodebookLoRASTELinear):
+            module._ql_uid = uid
+            uid += 1
             ste_modules.append(module)
 
     # One cosine scheduler shared across both optimizers
