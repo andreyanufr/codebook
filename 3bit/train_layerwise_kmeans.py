@@ -206,10 +206,13 @@ class CodebookLoRASTELinear(nn.Module):
             generator=gen,
         ).to(dtype=flat_data.dtype, device=flat_data.device)
         
-        
         centroids, _ = torch.sort(centroids)
         assert centroids.shape == (2**self.n_bits,)
-        self.codebook.copy_(centroids)
+        if step == 0:
+            self.codebook.copy_(centroids)
+        else:
+            # Moving average update with momentum 0.9
+            self.codebook.copy_(0.9 * self.codebook + 0.1 * centroids)
 
     # ------------------------------------------------------------------
     # Initialisation helpers
