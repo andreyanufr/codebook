@@ -91,10 +91,13 @@ class BlockInputCacher(nn.Module):
         return None
 
     def forward(self, hidden_states, **kwargs):
-        self.cached_inputs["hidden_states"].append(hidden_states.detach())
+        self.cached_inputs["hidden_states"].append(hidden_states.detach().cpu())
         for key in kwargs:
             if key not in self.cached_inputs:
                 self.cached_inputs[key] = kwargs[key]
+        
+        raise RuntimeError("This block is only for caching inputs and should not be used for actual forward pass.")
+    
         return self.block(hidden_states, **kwargs)
     
     def dump_cached_inputs(self, dir: str):
@@ -115,7 +118,10 @@ def get_first_block_inputs(model: nn.Module, dataset: list[Tensor], only_one_bat
 
     with torch.no_grad():
         for batch in track(dataset, description="Caching block inputs..."):
-            model(batch)
+            try:
+                model(batch)
+            except RuntimeError:
+                pass
             if only_one_batch:
                 break
 

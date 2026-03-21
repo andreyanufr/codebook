@@ -74,16 +74,6 @@ from utils import cleanup
 from train_layerwise import finetune_layerwise_ste
 from train_layerwise import wrap_model_ste, unwrap_model_ste, CodebookLoRASTELinear, save_codebook_layers, log_gradients_in_model
 
-def save_codebook_layers(model: nn.Module, output_dir: Path):
-    """
-    Saves the codebook layers of the model to the specified output directory.
-
-    :param model: The model containing the codebook layers to be saved.
-    :param output_dir: The directory where the codebook layers will be saved.
-    """
-    codebook_state_dict = {k: v.cpu() for k, v in model.state_dict().items() if "codebook" in k or "scale" in k}
-    torch.save(codebook_state_dict, output_dir / "codebook_layers.pth")
-    print(f"Codebook layers saved to {output_dir / 'codebook_layers.pth'}")
 
 
 def set_trainable(model: nn.Module) -> list[nn.Parameter]:
@@ -495,15 +485,23 @@ def main(argv) -> float:
     # One cosine scheduler shared across both optimizers
     total_opt_steps = args.epochs * epoch_samples // args.batch_size
     eta_min_ratio = 1e-4
-    scheduler_step_count = 0
 
     moving_average_gradient_norm = [0.0001 for _ in codebook_params + scales_params + lora_params]
     alpha = 0.99
     epoch_tag = "train all"
     
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total_opt_steps, eta_min=args.lr * eta_min_ratio)
+    
+    
+    if args.keep_data_on_cpu:
+        orig_hiddens = [h.cpu() for h in orig_hiddens]
+        torch.cuda.empty_cache()
+    
+    model = torch.compile(model)
 
     for epoch in range(args.epochs):
+        if epoch > -1:
+            save_codebook_layers(model, last_dir, epoch=epoch - 1)
 
         batch_indices_epoch = torch.randperm(num_samples)[:epoch_samples].chunk(microbatches_per_epoch)
 

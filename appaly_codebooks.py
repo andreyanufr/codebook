@@ -38,6 +38,13 @@ def get_argument_parser() -> argparse.ArgumentParser:
         "start from scratch by post-training weight compression initialization.",
     )
     
+    parser.add_argument(
+        "--n_layers",
+        type=int,
+        default=None,
+        help="Number of layers in the model. If not specified, it will be inferred from the model.",
+    )
+    
     return parser
 
 # main.py --pretrained Qwen/Qwen3-4B --codebooks_path /home/aanuf/proj/learnable_codebooks/3bit/qwen3_4B/STE_LORA_512_1024_samples_20_plus_epoch_90bs_adam_no_exp_scale_diff_lr_last/codebook_layers.pth --output_dir /home/aanuf/proj/learnable_codebooks/3bit/qwen3_4B/STE_LORA_512_1024_samples_20_plus_epoch_90bs_adam_no_exp_scale_diff_lr_last/tmp/
@@ -49,10 +56,25 @@ def main(argv):
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained)
     codebooks = torch.load(args.codebooks_path, map_location="cpu") if args.codebooks_path and Path(args.codebooks_path).is_file() else {}
     
+    keys = list(codebooks.keys())
+    
+    for k in keys:
+        if '_orig_mod.' in k:
+            codebook_key = k.replace('_orig_mod.', '')
+            if not codebook_key in codebooks:
+                codebooks[codebook_key] = codebooks[k]
+                del codebooks[k]
+    
+    layer_counter = 0
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear) and name in codebooks:
+            layer_counter += 1
             print(name, codebooks[name]["codebook"])
-            module.weight.data = dequantize_from_dict(codebooks[name],  module.weight.data.device)
+            module.weight.data = dequantize_from_dict(codebooks[name],  module.weight.data.device).to(module.weight.data.dtype)
+            del codebooks[name]  # free memory
+            torch.cuda.empty_cache()  # free memory
+            # if args.n_layers is not None and layer_counter >= args.n_layers:
+            #     break
 
     # Save the model with the applied codebooks
     model.save_pretrained(args.output_dir)
