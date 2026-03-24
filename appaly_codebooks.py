@@ -58,24 +58,31 @@ def main(argv):
     
     keys = list(codebooks.keys())
     
+    min_cb = -1000.0
     for k in keys:
         if '_orig_mod.' in k:
             codebook_key = k.replace('_orig_mod.', '')
             if not codebook_key in codebooks:
                 codebooks[codebook_key] = codebooks[k]
+                min_cb = max(min_cb, codebooks[k]["codebook"].abs().max().item())
                 del codebooks[k]
-    
+
     layer_counter = 0
+    mean_diff = 0.0
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear) and name in codebooks:
             layer_counter += 1
-            print(name, codebooks[name]["codebook"])
-            module.weight.data = dequantize_from_dict(codebooks[name],  module.weight.data.device).to(module.weight.data.dtype)
+            #print(name, codebooks[name]["codebook"])
+            dequantized = dequantize_from_dict(codebooks[name],  module.weight.data.device).to(module.weight.data.dtype)
+            diff = (module.weight.data - dequantized).abs().max().item()
+            mean_diff += (module.weight.data - dequantized).abs().mean().item() / module.weight.data.abs().mean().item()
+            print(f"Max absolute difference between original and dequantized weights for layer {name}: {diff}")
+            module.weight.data = dequantized
             del codebooks[name]  # free memory
             torch.cuda.empty_cache()  # free memory
             # if args.n_layers is not None and layer_counter >= args.n_layers:
             #     break
-
+    print(f"Average relative difference between original and dequantized weights: {mean_diff / layer_counter if layer_counter > 0 else 0.0}")
     # Save the model with the applied codebooks
     model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)

@@ -487,10 +487,16 @@ def main(argv) -> float:
     eta_min_ratio = 1e-4
 
     moving_average_gradient_norm = [0.0001 for _ in codebook_params + scales_params + lora_params]
-    alpha = 0.99
+    average_gradient_norm = [0.0001 for _ in codebook_params + scales_params + lora_params]
+    
+    alpha = 0.9
     epoch_tag = "train all"
     
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total_opt_steps, eta_min=args.lr * eta_min_ratio)
+    
+    # scheduler = torch.optim.lr_scheduler.LinearLR(
+    #         opt, start_factor=1.0, end_factor=0.0, total_iters=total_opt_steps
+    #     )
     
     
     if args.keep_data_on_cpu:
@@ -498,9 +504,10 @@ def main(argv) -> float:
         torch.cuda.empty_cache()
     
     model = torch.compile(model)
+    n_updates = 0
 
     for epoch in range(args.epochs):
-        if epoch > -1:
+        if epoch > 0:
             save_codebook_layers(model, last_dir, epoch=epoch - 1)
 
         batch_indices_epoch = torch.randperm(num_samples)[:epoch_samples].chunk(microbatches_per_epoch)
@@ -535,6 +542,7 @@ def main(argv) -> float:
             grad_steps += 1
             (loss / grad_accumulation_steps).backward()
             if grad_steps == grad_accumulation_steps:
+                n_updates += 1
                 # if epoch_tag == "codebooks":
                 #     # for codebooks restrict changes by the 0.1 of mean distance between codebook values
                 #     for p in codebook_params:
@@ -550,14 +558,16 @@ def main(argv) -> float:
 
                 for i, p in enumerate(codebook_params + scales_params + lora_params):
                     if p.grad is not None:
-                        grad_norm = p.grad.data.norm().item()
+                        grad_norm = p.grad.data.abs().max().item()
                         if not math.isfinite(grad_norm):
                             print(f"WARNING: Non-finite gradient norm at step {total_steps}. Skipping update.")
                             opt.zero_grad()
                             loss_numerator = grad_steps = 0
                             break
+                        average_gradient_norm[i] = ((n_updates - 1) * average_gradient_norm[i] + grad_norm) / n_updates
                         moving_average_gradient_norm[i] = alpha * moving_average_gradient_norm[i] + (1 - alpha) * grad_norm
                         adaptive_clip_value = min(0.01, moving_average_gradient_norm[i])
+                        adaptive_clip_value = min(adaptive_clip_value, average_gradient_norm[i])
                         torch.nn.utils.clip_grad_value_([p], adaptive_clip_value)
                 else:
                     opt.step()

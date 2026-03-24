@@ -232,7 +232,10 @@ class CodebookLoRASTELinear(nn.Module):
     def dequantize_by_distance(self, codebook, normalized, return_indexes = False):
         thresholds = (codebook[:-1] + codebook[1:]) * 0.5
         
-        idx = torch.bucketize(normalized, thresholds)
+        sigma = torch.abs(codebook[:-1] - codebook[1:]).mean() * 0.05 + 1e-8
+        
+        # stochasticity for better exploration of codebook assignments during training
+        idx = torch.bucketize(normalized + sigma * torch.randn_like(normalized), thresholds)
         
         if return_indexes:
             return idx
