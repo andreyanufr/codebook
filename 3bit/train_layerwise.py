@@ -99,8 +99,8 @@ class CodebookLoRASTELinear(nn.Module):
         n_bits: int = 2,
         lora_rank: int = 32,
         lora_alpha: float = 32.0,
-        use_exp_for_scale: bool = True,
-        use_exp_for_lora: bool = True,
+        use_exp_for_scale: bool = False,
+        use_exp_for_lora: bool = False,
         ste_temperature: float = 1.0,
     ):
         super().__init__()
@@ -232,7 +232,7 @@ class CodebookLoRASTELinear(nn.Module):
     def dequantize_by_distance(self, codebook, normalized, return_indexes = False):
         thresholds = (codebook[:-1] + codebook[1:]) * 0.5
         
-        sigma = torch.abs(codebook[:-1] - codebook[1:]).mean() * 0.05 + 1e-8
+        sigma = self.ste_temperature * (torch.abs(codebook[:-1] - codebook[1:]).mean() * 0.05 + 1e-8)
         
         # stochasticity for better exploration of codebook assignments during training
         idx = torch.bucketize(normalized + sigma * torch.randn_like(normalized), thresholds)
@@ -252,6 +252,11 @@ class CodebookLoRASTELinear(nn.Module):
 
         return (normalized - normalized.detach()) + quantized
 
+    def _get_scale(self):
+        if self.use_exp_for_scale:
+            return self.scale.clamp(-20.0, 20.0).exp()
+        else:
+            return self.scale.clamp(min=1e-5)
 
     def _get_normalized_weights(self, differentiable: bool = False):
         """Return ``(orig_weight + lora_delta) / scale`` (grouped).
@@ -270,19 +275,10 @@ class CodebookLoRASTELinear(nn.Module):
             out_features, in_features // self.group_size, self.group_size
         )
 
-        if differentiable:
-            if self.use_exp_for_scale:
-                iscale = get_reciprocal(self.scale.clamp(-20.0, 20.0).exp())
-            else:
-                iscale = get_reciprocal(self.scale)
-            return weight * iscale
-        else:
-            with torch.no_grad():
-                if self.use_exp_for_scale:
-                    iscale = get_reciprocal(self.scale.clamp(-20.0, 20.0).exp())
-                else:
-                    iscale = get_reciprocal(self.scale)
-                return weight * iscale
+        scale = self._get_scale()
+        iscale = get_reciprocal(scale)
+        normalized = weight * iscale
+        return normalized
 
     # ------------------------------------------------------------------
     # Weight-space MSE initialization (same strategy as CodebookWrapperLinear)

@@ -74,9 +74,9 @@ def main(argv):
             layer_counter += 1
             #print(name, codebooks[name]["codebook"])
             dequantized = dequantize_from_dict(codebooks[name],  module.weight.data.device).to(module.weight.data.dtype)
-            diff = (module.weight.data - dequantized).abs().max().item()
-            mean_diff += (module.weight.data - dequantized).abs().mean().item() / module.weight.data.abs().mean().item()
-            print(f"Max absolute difference between original and dequantized weights for layer {name}: {diff}")
+            diff = (module.weight.data.to(dequantized.dtype) - dequantized).abs().max().item()
+            mean_diff += (module.weight.data.to(dequantized.dtype) - dequantized).abs().mean().item() / module.weight.data.to(dequantized.dtype).abs().mean().item()
+            #print(f"Max absolute difference between original and dequantized weights for layer {name}: {diff}")
             module.weight.data = dequantized
             del codebooks[name]  # free memory
             torch.cuda.empty_cache()  # free memory

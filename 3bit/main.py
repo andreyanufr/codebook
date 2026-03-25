@@ -486,8 +486,8 @@ def main(argv) -> float:
     total_opt_steps = args.epochs * epoch_samples // args.batch_size
     eta_min_ratio = 1e-4
 
-    moving_average_gradient_norm = [0.0001 for _ in codebook_params + scales_params + lora_params]
-    average_gradient_norm = [0.0001 for _ in codebook_params + scales_params + lora_params]
+    #moving_average_gradient_norm = {p: 0.0001 for p in [codebook_params, scales_params, lora_params]}
+    moving_average_gradient_norm = {"codebook": [codebook_params, 0.0001], "scales": [scales_params, 0.0001], "lora": [lora_params, 0.0001]}
     
     alpha = 0.9
     epoch_tag = "train all"
@@ -556,18 +556,32 @@ def main(argv) -> float:
                 # Global gradient norm clip to prevent explosion
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-                for i, p in enumerate(codebook_params + scales_params + lora_params):
-                    if p.grad is not None:
+                # for i, p in enumerate(codebook_params + scales_params + lora_params):
+                #     if p.grad is not None:
+                #         grad_norm = p.grad.data.abs().max().item()
+                #         if not math.isfinite(grad_norm):
+                #             print(f"WARNING: Non-finite gradient norm at step {total_steps}. Skipping update.")
+                #             opt.zero_grad()
+                #             loss_numerator = grad_steps = 0
+                #             break
+                #         average_gradient_norm[i] = ((n_updates - 1) * average_gradient_norm[i] + grad_norm) / n_updates
+                #         moving_average_gradient_norm[i] = alpha * moving_average_gradient_norm[i] + (1 - alpha) * grad_norm
+                #         adaptive_clip_value = min(0.01, moving_average_gradient_norm[i])
+                #         adaptive_clip_value = min(adaptive_clip_value, average_gradient_norm[i])
+                #         torch.nn.utils.clip_grad_value_([p], adaptive_clip_value)
+                for name, [params, avg_norm] in moving_average_gradient_norm.items():
+                    avg_max = 0.0
+                    for p in params:
                         grad_norm = p.grad.data.abs().max().item()
                         if not math.isfinite(grad_norm):
-                            print(f"WARNING: Non-finite gradient norm at step {total_steps}. Skipping update.")
-                            opt.zero_grad()
-                            loss_numerator = grad_steps = 0
-                            break
-                        average_gradient_norm[i] = ((n_updates - 1) * average_gradient_norm[i] + grad_norm) / n_updates
-                        moving_average_gradient_norm[i] = alpha * moving_average_gradient_norm[i] + (1 - alpha) * grad_norm
-                        adaptive_clip_value = min(0.01, moving_average_gradient_norm[i])
-                        adaptive_clip_value = min(adaptive_clip_value, average_gradient_norm[i])
+                            raise ValueError(f"WARNING: Non-finite gradient norm at step {total_steps}. Skipping update.")
+                        avg_max += grad_norm
+                    avg_max /= len(params)
+                    
+                    moving_average_gradient_norm[name][1] = alpha * moving_average_gradient_norm[name][1] + (1 - alpha) * avg_max
+                    adaptive_clip_value = min(0.001, moving_average_gradient_norm[name][1])
+
+                    for p in params:
                         torch.nn.utils.clip_grad_value_([p], adaptive_clip_value)
                 else:
                     opt.step()
@@ -589,6 +603,9 @@ def main(argv) -> float:
                 if aggregated_loss < 0.007:
                     print(f"Early stopping at epoch {epoch} with loss {aggregated_loss:.6f}")
                     break
+        for layer in ste_modules:
+            layer.ste_temperature = layer.ste_temperature * 0.9
+        print("Temperature updated for STE layers: ", ste_modules[0].ste_temperature)
 
                 
 
