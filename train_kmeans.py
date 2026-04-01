@@ -71,9 +71,19 @@ from transformers import AutoTokenizer
 from nncf.common.logging.track_progress import track
 
 from utils import cleanup
-from train_layerwise import finetune_layerwise_ste
-from train_layerwise import wrap_model_ste, unwrap_model_ste, CodebookLoRASTELinear, save_codebook_layers, log_gradients_in_model
+from train_layerwise_kmeans import finetune_layerwise_ste
+from train_layerwise_kmeans import wrap_model_ste, unwrap_model_ste, CodebookLoRASTELinear, save_codebook_layers, log_gradients_in_model
 
+def save_codebook_layers(model: nn.Module, output_dir: Path):
+    """
+    Saves the codebook layers of the model to the specified output directory.
+
+    :param model: The model containing the codebook layers to be saved.
+    :param output_dir: The directory where the codebook layers will be saved.
+    """
+    codebook_state_dict = {k: v.cpu() for k, v in model.state_dict().items() if "codebook" in k or "scale" in k}
+    torch.save(codebook_state_dict, output_dir / "codebook_layers.pth")
+    print(f"Codebook layers saved to {output_dir / 'codebook_layers.pth'}")
 
 
 def set_trainable(model: nn.Module) -> list[nn.Parameter]:
@@ -316,7 +326,6 @@ def get_argument_parser() -> argparse.ArgumentParser:
         "For larger models (over 3 billion parameters), a learning rate of 5e-5 is recommended.",
     )
     parser.add_argument("--epochs", type=int, default=50, help="Number of epochs.") #default=10
-    parser.add_argument("--warmup_epochs", type=int, default=0, help="Number of warmup epochs for learning rate scheduler.")
     parser.add_argument("--batch_size", type=int, default=64, help="Size of training batch.")
     parser.add_argument(
         "--microbatch_size",
@@ -360,13 +369,6 @@ def get_argument_parser() -> argparse.ArgumentParser:
         "--keep_data_on_cpu",
         action="store_true",
         help="Whether to keep the data on CPU during training. This can be useful for large datasets that do not fit in GPU memory.",
-    )
-    
-    parser.add_argument(
-        "--load_codebooks_path",
-        type=str,
-        default=None,
-        help="Path to the codebooks file for loading.",
     )
 
     return parser
@@ -459,48 +461,9 @@ def main(argv) -> float:
         orig_hiddens = calc_hiddens(model, train_loader)
         torch.save(orig_hiddens, hiddens_dir)
 
-    if args.keep_data_on_cpu:
-        orig_hiddens = [h.cpu() for h in orig_hiddens]
-        torch.cuda.empty_cache()
 
-    load_from_checkpoint = args.load_codebooks_path is not None and Path(args.load_codebooks_path).is_file()
-    model = wrap_model_ste(model, lora_rank=args.lora_rank, n_bits=args.num_bits, group_size=32 if '1B' in args.pretrained else 64,
-                           use_mse_init=not load_from_checkpoint)
+    model = wrap_model_ste(model, lora_rank=args.lora_rank, n_bits=args.num_bits, group_size=32 if '1B' in args.pretrained else 64)
     torch.cuda.empty_cache()
-
-    
-    save_codebook_layers(model, last_dir, epoch=-1)
-    
-    if load_from_checkpoint:
-        codebooks = torch.load(args.load_codebooks_path, map_location="cpu") if args.load_codebooks_path and Path(args.load_codebooks_path).is_file() else {}
-        keys = list(codebooks.keys())
-        
-        for k in keys:
-            if '_orig_mod.' in k:
-                codebook_key = k.replace('_orig_mod.', '')
-                if not codebook_key in codebooks:
-                    codebooks[codebook_key] = codebooks[k]
-                    del codebooks[k]
-
-        layer_counter = 0
-        for name, module in model.named_modules():
-            if isinstance(module, CodebookLoRASTELinear) and name in codebooks:
-                layer_counter += 1
-                state_dict = codebooks[name]
-                codebook = state_dict["codebook"]
-                scale = state_dict["scale"]
-                module.scale.data.copy_(scale)
-                module.codebook.data.copy_(codebook)
-                
-                if hasattr(module, "lora") and "lora" in state_dict:
-                    module.lora.data.copy_(state_dict["lora"])
-                elif hasattr(module, "lora_A") and "lora_A" in state_dict:
-                    module.lora_A.data.copy_(state_dict["lora_A"])
-                    module.lora_B.data.copy_(state_dict["lora_B"])
-                    module.lora_r.data.copy_(state_dict["lora_r"])
-                    module.lora_c.data.copy_(state_dict["lora_c"])
-                    
-        print(f"Loaded codebooks for {layer_counter} layers from {args.load_codebooks_path}")
 
     # Original full-model training with KL divergence
     print("\n" + "="*80)
@@ -508,24 +471,13 @@ def main(argv) -> float:
     print("="*80 + "\n")
     
 
-    scales_params, codebook_params, lora_params = set_trainable(model)
+    scales_params, _, lora_params = set_trainable(model)
 
     # Two optimizers: one for codebooks (even epochs), one for scales+lora (odd epochs)
     opt = torch.optim.AdamW([
-        {"params": codebook_params, "lr": args.lr},
         {"params": scales_params, "lr": args.lr},
         {"params": lora_params, "lr": args.lr},
-        ],
-        weight_decay=0.0,
-        eps=1e-4)
-
-    # opt = torch.optim.SGD([
-    #     {"params": codebook_params, "lr": args.lr},
-    #     {"params": scales_params, "lr": args.lr},
-    #     {"params": lora_params, "lr": args.lr},
-    # ],
-    # momentum=0.9
-    # )
+    ])
 
     # Run tuning with distillation loss and validation after each epoch.
     grad_accumulation_steps = args.batch_size // args.microbatch_size
@@ -535,51 +487,29 @@ def main(argv) -> float:
     aggregated_loss = float("nan")
     loss_numerator = grad_steps = total_steps = 0
     ste_modules = []
+    uid = 0
     for module in model.modules():
         if isinstance(module, CodebookLoRASTELinear):
+            module._ql_uid = uid
+            uid += 1
             ste_modules.append(module)
 
     # One cosine scheduler shared across both optimizers
     total_opt_steps = args.epochs * epoch_samples // args.batch_size
     eta_min_ratio = 1e-4
+    scheduler_step_count = 0
 
-    #moving_average_gradient_norm = {p: 0.0001 for p in [codebook_params, scales_params, lora_params]}
-    moving_average_gradient_norm = {"codebook": [codebook_params, 0.0001], "scales": [scales_params, 0.0001], "lora": [lora_params, 0.0001]}
-    
-    alpha = 0.9
+    moving_average_gradient_norm = [0.0001 for _ in scales_params + lora_params]
+    alpha = 0.99
     epoch_tag = "train all"
     
-    warmup_steps = args.warmup_epochs * epoch_samples // args.batch_size
-    if warmup_steps > 0:
-        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(opt, start_factor=1e-6, end_factor=1.0, total_iters=warmup_steps)
-        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total_opt_steps - warmup_steps, eta_min=args.lr * eta_min_ratio)
-        scheduler = torch.optim.lr_scheduler.SequentialLR(opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
-    else:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total_opt_steps, eta_min=args.lr * eta_min_ratio)
-    
-    model = torch.compile(model)
-    n_updates = 0
-    min_loss = float("inf")
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total_opt_steps, eta_min=args.lr * eta_min_ratio)
 
     for epoch in range(args.epochs):
-        loss_numerator = grad_steps = 0
-        opt.zero_grad()
-        if epoch > 0:
-            save_codebook_layers(model, last_dir, epoch=epoch - 1)
-        # if epoch == 2:
-        #     del opt
-        #     torch.cuda.empty_cache()
-        #     opt = torch.optim.SGD([
-        #             {"params": codebook_params, "lr": args.lr},
-        #             {"params": scales_params, "lr": args.lr},
-        #             {"params": lora_params, "lr": args.lr},
-        #         ],
-        #         momentum=0.9)
-        #     scheduler.optimizer = opt
 
         batch_indices_epoch = torch.randperm(num_samples)[:epoch_samples].chunk(microbatches_per_epoch)
 
-        for indices in track(batch_indices_epoch, description=f"Train epoch {epoch} [{epoch_tag}] {loss_numerator / grad_steps if grad_steps > 0 else -1.0}"):
+        for indices in track(batch_indices_epoch, description=f"Train epoch {epoch} [{epoch_tag}]"):
             indices = indices.tolist()
 
             def form_batch(inputs: list[Tensor], model_input: bool):
@@ -609,91 +539,44 @@ def main(argv) -> float:
             grad_steps += 1
             (loss / grad_accumulation_steps).backward()
             if grad_steps == grad_accumulation_steps:
-                n_updates += 1
-                # if epoch_tag == "codebooks":
-                #     # for codebooks restrict changes by the 0.1 of mean distance between codebook values
-                #     for p in codebook_params:
-                #         with torch.no_grad():
-                #             cb_vals = p.data.view(-1)
-                #             dist = torch.mean(torch.abs(cb_vals[:, None] - cb_vals[None, :])).item()
-                #             torch.nn.utils.clip_grad_norm_([p], max_norm=0.01 * dist)
-                # else:
-                #     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 
                 # Global gradient norm clip to prevent explosion
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, error_if_nonfinite=True)
-                #torch.nn.utils.clip_grad_value_(model.parameters(), clip_value=0.01)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-                # for i, p in enumerate(codebook_params + scales_params + lora_params):
-                #     if p.grad is not None:
-                #         grad_norm = p.grad.data.abs().max().item()
-                #         if not math.isfinite(grad_norm):
-                #             print(f"WARNING: Non-finite gradient norm at step {total_steps}. Skipping update.")
-                #             opt.zero_grad()
-                #             loss_numerator = grad_steps = 0
-                #             break
-                #         average_gradient_norm[i] = ((n_updates - 1) * average_gradient_norm[i] + grad_norm) / n_updates
-                #         moving_average_gradient_norm[i] = alpha * moving_average_gradient_norm[i] + (1 - alpha) * grad_norm
-                #         adaptive_clip_value = min(0.01, moving_average_gradient_norm[i])
-                #         adaptive_clip_value = min(adaptive_clip_value, average_gradient_norm[i])
-                #         torch.nn.utils.clip_grad_value_([p], adaptive_clip_value)
+                for i, p in enumerate(scales_params + lora_params):
+                    if p.grad is not None:
+                        grad_norm = p.grad.data.norm().item()
+                        if not math.isfinite(grad_norm):
+                            print(f"WARNING: Non-finite gradient norm at step {total_steps}. Skipping update.")
+                            opt.zero_grad()
+                            loss_numerator = grad_steps = 0
+                            break
+                        moving_average_gradient_norm[i] = alpha * moving_average_gradient_norm[i] + (1 - alpha) * grad_norm
+                        adaptive_clip_value = min(0.01, moving_average_gradient_norm[i])
+                        torch.nn.utils.clip_grad_value_([p], adaptive_clip_value)
+                else:
+                    opt.step()
                 
-                # add noise to gradients to escape potential local minima and encourage exploration, especially in the early stages of training
-                # for p in codebook_params + scales_params + lora_params:
-                #     p.grad += torch.randn_like(p.grad) * 0.001
-
-                # for name, [params, avg_norm] in moving_average_gradient_norm.items():
-                #     avg_max = 0.0
-                #     for p in params:
-                #         grad_norm = p.grad.data.abs().max().item()
-                #         if not math.isfinite(grad_norm):
-                #             raise ValueError(f"WARNING: Non-finite gradient norm at step {total_steps}. Skipping update.")
-                #         avg_max += grad_norm
-                #     avg_max /= len(params)
-                    
-                #     moving_average_gradient_norm[name][1] = alpha * moving_average_gradient_norm[name][1] + (1 - alpha) * avg_max
-                #     adaptive_clip_value = min(0.01, moving_average_gradient_norm[name][1])
-
-                #     for p in params:
-                #         torch.nn.utils.clip_grad_value_([p], adaptive_clip_value)
-                    # for p in params:
-                    #     p.grad.data /= torch.sqrt(torch.mean(p.grad.data ** 2) + 1e-6)
-
-                # if n_updates % 3 == 0:
-                #     for p in codebook_params:
-                #         p.grad *= 0.000001
-                # elif n_updates % 3 == 1:
-                #     for p in scales_params:
-                #         p.grad *= 0.000001
-                # else:
-                #     for p in lora_params:
-                #         p.grad *= 0.000001
-
-                opt.step()
-                aggregated_loss = loss_numerator / grad_steps
-                total_steps += 1
-                tb.add_scalar("loss", aggregated_loss, total_steps)
-                tb.add_scalar("lr", opt.param_groups[0]["lr"], total_steps)
-                log_gradients_in_model(model, tb, total_steps, "all")
+                    aggregated_loss = loss_numerator / grad_steps
+                    total_steps += 1
+                    tb.add_scalar("loss", aggregated_loss, total_steps)
+                    tb.add_scalar("lr", opt.param_groups[0]["lr"], total_steps)
+                    log_gradients_in_model(model, tb, total_steps, "all")
 
                 loss_numerator = grad_steps = 0
                 opt.zero_grad()
                 scheduler.step()
 
-                for m in ste_modules:
-                    if hasattr(m, "update_indexes"):
-                        m.update_indexes()
+                if total_steps % (4 * grad_accumulation_steps) == 0:
+                    for m in ste_modules:
+                        if hasattr(m, "update_codebook"):
+                            m.update_codebook(total_steps)
 
                 if aggregated_loss < 0.007:
                     print(f"Early stopping at epoch {epoch} with loss {aggregated_loss:.6f}")
                     break
-        for layer in ste_modules:
-            layer.ste_temperature = layer.ste_temperature * 0.9
-        print("Temperature updated for STE layers: ", ste_modules[0].ste_temperature)
-        if aggregated_loss < min_loss:
-            min_loss = aggregated_loss
-            save_codebook_layers(model, last_dir, epoch="best", save_lora=True)
 
+                
 
     save_codebook_layers(model, last_dir)
     model = unwrap_model_ste(model)
