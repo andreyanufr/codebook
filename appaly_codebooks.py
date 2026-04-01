@@ -47,6 +47,17 @@ def get_argument_parser() -> argparse.ArgumentParser:
     
     return parser
 
+
+def fake_quantize_int8_per_channel(tensor):
+    # Get the maximum absolute value for each output channel (dim=0)
+    max_abs_per_channel = tensor.abs().max(dim=0).values
+    # Avoid division by zero by adding a small epsilon
+    epsilon = 1e-8
+    scale = max_abs_per_channel / 127.0 + epsilon
+    # Quantize the tensor to int8
+    quantized = (tensor / scale).round().clamp(-128, 127).to(torch.int8)
+    return (quantized * scale).to(tensor.dtype).to(tensor.device)
+
 # main.py --pretrained Qwen/Qwen3-4B --codebooks_path /home/aanuf/proj/learnable_codebooks/3bit/qwen3_4B/STE_LORA_512_1024_samples_20_plus_epoch_90bs_adam_no_exp_scale_diff_lr_last/codebook_layers.pth --output_dir /home/aanuf/proj/learnable_codebooks/3bit/qwen3_4B/STE_LORA_512_1024_samples_20_plus_epoch_90bs_adam_no_exp_scale_diff_lr_last/tmp/
 def main(argv):
     parser = get_argument_parser()
@@ -55,6 +66,9 @@ def main(argv):
     model = AutoModelForCausalLM.from_pretrained(args.pretrained, torch_dtype=torch.float16, device_map="auto")
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained)
     codebooks = torch.load(args.codebooks_path, map_location="cpu") if args.codebooks_path and Path(args.codebooks_path).is_file() else {}
+    
+    if len(codebooks.keys()) == 0:
+        raise NotImplementedError("No codebooks found at the specified path. Please provide a valid path to the codebooks or ensure that the file exists.")  
     
     keys = list(codebooks.keys())
     
@@ -69,19 +83,35 @@ def main(argv):
 
     layer_counter = 0
     mean_diff = 0.0
+    sz_in_bytes = 0
+
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear) and name in codebooks:
             layer_counter += 1
             #print(name, codebooks[name]["codebook"])
-            dequantized = dequantize_from_dict(codebooks[name],  module.weight.data.device).to(module.weight.data.dtype)
+            state = codebooks[name]
+            dequantized = dequantize_from_dict(state,  module.weight.data.device).to(module.weight.data.dtype)
             diff = (module.weight.data.to(dequantized.dtype) - dequantized).abs().max().item()
             mean_diff += (module.weight.data.to(dequantized.dtype) - dequantized).abs().mean().item() / module.weight.data.to(dequantized.dtype).abs().mean().item()
             #print(f"Max absolute difference between original and dequantized weights for layer {name}: {diff}")
             module.weight.data = dequantized
             del codebooks[name]  # free memory
-            torch.cuda.empty_cache()  # free memory
+            torch.cuda.empty_cache()
+            sz_in_bytes += state["codebook"].numel() * state["codebook"].element_size() + state["indexes"].numel() * state["indexes"].element_size() + state["scale"].numel() * state["scale"].element_size()
+        else:
+            if isinstance(module, nn.Linear) or isinstance(module, nn.Embedding):
+                module.weight.data = fake_quantize_int8_per_channel(module.weight.data)
+                sz_in_bytes += module.weight.data.numel() + module.weight.shape[0] * 2  # int8 weights + per-channel scales
+            elif hasattr(module, 'weight'):    
+                sz_in_bytes += module.weight.data.numel() * module.weight.data.element_size()
+            else:
+                print(f"Module {name} does not have weight attribute.")
+                # for param in module.parameters():
+                #     sz_in_bytes += param.data.numel() * param.data.element_size()
+              # free memory
             # if args.n_layers is not None and layer_counter >= args.n_layers:
             #     break
+    print(f"Total size of the model with applied codebooks: {sz_in_bytes / (1024 * 1024):.2f} MB or {sz_in_bytes / (1024 * 1024 * 1024):.2f} GB")
     print(f"Average relative difference between original and dequantized weights: {mean_diff / layer_counter if layer_counter > 0 else 0.0}")
     # Save the model with the applied codebooks
     model.save_pretrained(args.output_dir)

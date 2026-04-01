@@ -102,6 +102,7 @@ class CodebookLoRASTELinear(nn.Module):
         use_exp_for_scale: bool = False,
         use_exp_for_lora: bool = False,
         ste_temperature: float = 1.0,
+        use_mse_init: bool = True,
     ):
         super().__init__()
 
@@ -174,7 +175,8 @@ class CodebookLoRASTELinear(nn.Module):
         self.orig_layer.weight.requires_grad = False
 
         # Weight-space MSE init for codebook + scale
-        self._mse_init()
+        if use_mse_init:
+            self._mse_init()
         
         # Save VRAM – move original weight to CPU (pulled back during STE fwd)
         self.orig_layer.to("cpu")
@@ -209,38 +211,38 @@ class CodebookLoRASTELinear(nn.Module):
             return (self.lora_B @ self.lora_A) * (self.lora_alpha / self.lora_rank) + self.lora_c + self.lora_r
 
 
-    def _get_effective_weight(self):
-        """Return ``orig_weight + lora_delta`` (2-D, on codebook device).
+    # def _get_effective_weight(self):
+    #     """Return ``orig_weight + lora_delta`` (2-D, on codebook device).
 
-        If LoRA parameters have not been created yet (during __init__),
-        returns just the original weight.
-        """
+    #     If LoRA parameters have not been created yet (during __init__),
+    #     returns just the original weight.
+    #     """
 
-        if not (hasattr(self, "lora_B") or hasattr(self, "lora")):
-            return self.orig_layer.weight.data.detach()
+    #     if not (hasattr(self, "lora_B") or hasattr(self, "lora")):
+    #         return self.orig_layer.weight.data.detach()
 
-        lora = self.get_lora()
-        if self.use_exp_for_lora:
-            # Clamp to prevent overflow (exp(10) ~ 22026 in bf16 range)
-            exponent = lora.clamp(-10.0, 10.0)
-            return self.orig_layer.weight.data.to(self.codebook.device) / torch.exp(exponent)
-        else:
-            return self.orig_layer.weight.data.to(self.codebook.device) + lora
+    #     lora = self.get_lora()
+    #     if self.use_exp_for_lora:
+    #         # Clamp to prevent overflow (exp(10) ~ 22026 in bf16 range)
+    #         exponent = lora.clamp(-10.0, 10.0)
+    #         return self.orig_layer.weight.data.to(self.codebook.device) / torch.exp(exponent)
+    #     else:
+    #         return self.orig_layer.weight.data.to(self.codebook.device) + lora
 
 
 
-    def dequantize_by_distance(self, codebook, normalized, return_indexes = False):
-        thresholds = (codebook[:-1] + codebook[1:]) * 0.5
-        
-        sigma = self.ste_temperature * (torch.abs(codebook[:-1] - codebook[1:]).mean() * 0.05 + 1e-8)
-        
+    def dequantize_by_distance(self, codebook, normalized, return_indexes = False, noise=None):
         # stochasticity for better exploration of codebook assignments during training
-        idx = torch.bucketize(normalized + sigma * torch.randn_like(normalized), thresholds)
+        thresholds = (codebook[:-1] + codebook[1:]) / 2
+        
+        #noise = torch.randn_like(normalized) * (self.ste_temperature * (torch.abs(codebook[:-1] - codebook[1:]).mean().detach().item() * 0.05 + 1e-8))
+
+        idx = torch.bucketize(normalized, thresholds)
         
         if return_indexes:
             return idx
 
-        if self.use_one_hot or self.n_bits == 2 or True:#codebook.requires_grad:
+        if self.use_one_hot or self.n_bits == 2:#codebook.requires_grad:
             # train only codebook
             one_hot = F.one_hot(
                 idx, num_classes=2 ** self.n_bits
@@ -264,20 +266,26 @@ class CodebookLoRASTELinear(nn.Module):
         If *differentiable* is True, gradients flow through ``scale``
         and the LoRA parameters.
         """
-        if differentiable:
-            weight = self._get_effective_weight()
-        else:
-            with torch.no_grad():
-                weight = self._get_effective_weight()
-
+        weight = self.orig_layer.weight.data.to(self.codebook.device)
+        lora = self.get_lora()
+        
         out_features, in_features = weight.shape
         weight = weight.view(
             out_features, in_features // self.group_size, self.group_size
         )
-
+        lora = lora.view(
+            out_features, in_features // self.group_size, self.group_size
+        )
+        
         scale = self._get_scale()
         iscale = get_reciprocal(scale)
-        normalized = weight * iscale
+        if self.use_exp_for_lora:
+            # Clamp to prevent overflow (exp(10) ~ 22026 in bf16 range)
+            lora = lora.clamp(-10.0, 10.0)
+            lora = torch.exp(lora)
+            normalized = ((weight / lora) * iscale).clamp(-1.0, 1.0)
+        else:
+            normalized = (weight * iscale + lora).clamp(-1.0, 1.0)
         return normalized
 
     # ------------------------------------------------------------------
@@ -316,16 +324,40 @@ class CodebookLoRASTELinear(nn.Module):
         best_lora = lora.data.clone()
         best_codebook = self.codebook.data.clone()
         
-        print("initial codebook:", self.codebook.data)
+        #print("initial codebook:", self.codebook.data)
         
         self.use_one_hot = True
         not_improved_iters = 0
+        
+        
+        if self.n_bits == 2:
+            codebook_variants = [
+                torch.tensor([-1.0, -0.28, 0.28, 1.0], device=device),
+                torch.tensor([-1.0, 0.0, 0.28, 1.0], device=device),
+                torch.tensor([-1.0, -0.28, 0.0, 1.0], device=device),
+                torch.tensor([-1.0, 0.28, -0.28, 1.0], device=device),
+                torch.tensor([-1.0, 0.0, 0.5, 1.0], device=device),
+                torch.tensor([-1.0, -0.5, -0.0, 1.0], device=device)
+                ]
+            deq_weight = self._dequantize_hard()
+            best_diff = (orig_weight - deq_weight).abs().mean().item()
+            for cb in codebook_variants:
+                self.codebook.data.copy_(cb)
+                deq_weight = self._dequantize_hard()
+                diff = (orig_weight - deq_weight).abs().mean().item()
+                if diff < best_diff:
+                    best_diff = diff
+                    best_codebook = cb.clone()
+            self.codebook.data.copy_(best_codebook)
 
         for i in range(n_iters):
             optimizer.zero_grad()
             deq_weight = self._dequantize_ste()
 
             loss = F.mse_loss(deq_weight, orig_weight.to(deq_weight.dtype))
+            if i == 0:
+                print(f"  MSE init, loss: {loss.item():.6f}")
+            
             loss.backward()
             torch.nn.utils.clip_grad_norm_([self.scale, lora, self.codebook], max_norm=1.0)
             optimizer.step()
@@ -355,10 +387,11 @@ class CodebookLoRASTELinear(nn.Module):
         optimizer.zero_grad()
         del orig_weight, optimizer, scheduler
         del best_scale, best_lora, best_codebook
-        del best_loss
+        #del best_loss
         cleanup()
 
-        print("final codebook:", self.codebook.data)
+        #print("final codebook:", self.codebook.data)
+        print(f"  MSE end, loss: {best_loss:.6f}")
 
         self.orig_layer.weight.data = self.orig_layer.weight.data.to("cpu")
         self.orig_layer.to("cpu")
@@ -368,7 +401,9 @@ class CodebookLoRASTELinear(nn.Module):
     # ------------------------------------------------------------------
 
     def get_codebook(self):
-        return self.codebook / self.codebook.abs().max().clamp(min=1e-8)
+        cb = self.codebook / self.codebook.abs().max().clamp(min=1e-8)
+        cb, _ = cb.sort()
+        return cb
 
 
     def _dequantize_hard(self):
@@ -376,7 +411,7 @@ class CodebookLoRASTELinear(nn.Module):
         
         normalized = self._get_normalized_weights(differentiable=False)
         weight = self.dequantize_by_distance(self.get_codebook(), normalized)
-        scale = self.scale.clamp(-20.0, 20.0).exp() if self.use_exp_for_scale else self.scale
+        scale = self._get_scale()
         weight = weight * scale
         return weight.view(self.orig_layer.weight.shape).to(self.orig_layer.weight.dtype)
 
@@ -384,7 +419,7 @@ class CodebookLoRASTELinear(nn.Module):
         """Core STE dequantisation logic (may be wrapped by checkpoint)."""
         normalized = self._get_normalized_weights(differentiable=True)
         weight = self.dequantize_by_distance(self.get_codebook(), normalized)
-        scale = self.scale.clamp(-20.0, 20.0).exp() if self.use_exp_for_scale else self.scale
+        scale = self._get_scale()
         weight = weight * scale
         return weight.view(self.orig_layer.weight.shape).to(self.orig_layer.weight.dtype)
 
@@ -404,6 +439,7 @@ class CodebookLoRASTELinear(nn.Module):
            Assumes ``self.orig_layer`` is already on the same device as
            ``self.codebook`` (the training function handles this).
         """
+        #with torch.no_grad():
         if not self.use_one_hot:
             return _checkpoint(self._dequantize_ste_impl, use_reentrant=False)
         return self._dequantize_ste_impl()
@@ -412,42 +448,9 @@ class CodebookLoRASTELinear(nn.Module):
     # LoRA
     # ------------------------------------------------------------------
 
-    def _lora_weight(self):
-        """Compute LoRA correction ``B @ A * (alpha / rank)``."""
-        return self.get_lora()
-
     @torch.no_grad()
     def merge_lora(self):
-        """Absorb the LoRA correction into the original weight.
-
-        Because the STE path already quantises ``orig_weight + lora_delta``,
-        the codebook, scale, and indexes are already adapted to the merged
-        weight.  Merging therefore only needs to:
-
-        1. ``orig_weight ← orig_weight + B @ A * α/r``
-        2. Final ``update_indexes()`` to snap indexes to the merged weight.
-        3. Zero out LoRA matrices.
-
-        No expensive re-quantisation loop is required.
-        """
-        device = self.codebook.device
-
-        # 1. Compute merged fp weight and write it back
-        self.orig_layer.to(device)
-
-        self.orig_layer.weight.data = self._get_effective_weight().to(self.orig_layer.weight.dtype)
-
-        # 2. Zero out LoRA so _get_effective_weight() == orig_weight
-        if self.lora_rank != -1:
-            self.lora_B.data.zero_()
-            self.lora_A.data.zero_()
-            self.lora_c.data.zero_()
-            self.lora_r.data.zero_()
-        else:
-            self.lora.data.zero_()
-
-        # Move orig weight back to CPU to save VRAM
-        self.orig_layer.to("cpu")
+        pass
 
     # ------------------------------------------------------------------
     # Forward
@@ -458,8 +461,6 @@ class CodebookLoRASTELinear(nn.Module):
             # LoRA is already folded into the STE quantisation path
             w = self._dequantize_ste()
         else:
-            # After merge_lora(), LoRA is absorbed into orig_weight and
-            # the codebook/scale/indexes already represent it.
             w = self._dequantize_hard()
         return F.linear(x, w)
     
@@ -498,28 +499,38 @@ class CodebookLoRASTELinear(nn.Module):
 
 
     @torch.no_grad()
-    def get_state_dict(self):
+    def get_state_dict(self, get_lora=False):
         """Return a state dict containing just the codebook, scale, and indexes."""
-        return {
+        state_dict = {
             "codebook": self.get_codebook().data.cpu(),
             "scale": (self.scale.clamp(-20.0, 20.0).exp() if self.use_exp_for_scale else self.scale).data.cpu(),
             "shape": self.orig_layer.weight.shape,
-            "indexes": self.get_compressed_indexes().cpu(),
         }
+        if get_lora:
+            if self.lora_rank != -1:
+                state_dict["lora_A"] = self.lora_A.data.cpu()
+                state_dict["lora_B"] = self.lora_B.data.cpu()
+                state_dict["lora_c"] = self.lora_c.data.cpu()
+                state_dict["lora_r"] = self.lora_r.data.cpu()
+            else:
+                state_dict["lora"] = self.lora.data.cpu()
+        state_dict["indexes"] = self.get_compressed_indexes().cpu()
+        return state_dict
 
 
-def save_codebook_layers(model: nn.Module, output_dir: Path, epoch: Optional[int] = None):
+def save_codebook_layers(model: nn.Module, output_dir: Path, epoch: Optional[int] = None, save_lora: bool = False):
     """
     Saves the codebook layers of the model to the specified output directory.
 
     :param model: The model containing the codebook layers to be saved.
     :param output_dir: The directory where the codebook layers will be saved.
     :param epoch: The current epoch number (optional).
+    :param save_lora: Whether to save LoRA parameters separately (optional).
     """
     codebook_state_dict = {}
     for name, module in model.named_modules():
         if isinstance(module, CodebookLoRASTELinear):
-            codebook_state_dict[name] = module.get_state_dict()
+            codebook_state_dict[name] = module.get_state_dict(get_lora=save_lora)
 
     if epoch is not None:
         torch.save(codebook_state_dict, output_dir / f"codebook_layers_epoch_{epoch}.pth")
@@ -542,6 +553,7 @@ def wrap_model_block_ste(
     layer_index: int = -1,
     n_layers: int = -1,
     use_llama_cpp_scheme: bool = True,
+    use_mse_init: bool = True,
 ) -> nn.Module:
     """Replace ``nn.Linear`` layers in *block* with ``CodebookLoRASTELinear``."""
     changed_modules: dict[str, nn.Module] = {}
@@ -573,6 +585,7 @@ def wrap_model_block_ste(
                 lora_rank=lora_rank,
                 lora_alpha=lora_alpha,
                 group_size=group_size,
+                use_mse_init=use_mse_init,
             ),
         )
     cleanup()
@@ -588,6 +601,7 @@ def wrap_model_block_ste(
                 lora_rank=lora_rank // 2 if lora_rank != -1 else 512,
                 lora_alpha=lora_alpha,
                 group_size=2 * group_size,
+                use_mse_init=use_mse_init,
             ),
         )
     
@@ -602,7 +616,6 @@ def wrap_model_block_ste(
 def unwrap_model_block_ste(block: nn.Module) -> nn.Module:
     """Unwrap ``CodebookLoRASTELinear`` → ``nn.Linear`` with dequantized weight.
 
-    Assumes ``merge_lora()`` has already been called so the LoRA delta is
     folded into the codebook representation.  The unwrapped linear layer
     gets the dequantized (codebook-only) weight.
     """
@@ -620,13 +633,15 @@ def wrap_model_ste(model: nn.Module,
                 n_bits: int = 2,
                 lora_rank: int = 32,
                 group_size: int = 32,
-                lora_alpha: float = 32.0,) -> nn.Module:
+                lora_alpha: float = 32.0,
+                use_mse_init: bool = True) -> nn.Module:
     """Wrap all ``nn.Linear`` layers in the full model with
     ``CodebookLoRASTELinear``."""
     for i, layer in enumerate(model.model.layers):
         model.model.layers[i] = wrap_model_block_ste(layer, layer_index=i, n_layers=len(model.model.layers),
                                                      n_bits=n_bits, lora_rank=lora_rank,
-                                                     group_size=group_size, lora_alpha=lora_alpha)
+                                                     group_size=group_size, lora_alpha=lora_alpha,
+                                                     use_mse_init=use_mse_init)
     return model
 
 
