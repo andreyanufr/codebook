@@ -59,7 +59,6 @@ import torch
 import torch.nn.functional as F
 import transformers
 from datasets import load_dataset
-from lm_eval.models.optimum_lm import OptimumLM
 
 from torch import Tensor
 from torch import nn
@@ -67,8 +66,7 @@ from torch.jit import TracerWarning
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM
 from transformers import AutoTokenizer
-
-from nncf.common.logging.track_progress import track
+from tqdm import tqdm
 
 from utils import cleanup
 from train_layerwise import finetune_layerwise_ste
@@ -183,27 +181,6 @@ def get_wikitext2(num_samples: int, seqlen: int, tokenizer: Any, device: torch.d
         trainloader.append(inp)
     return trainloader
 
-@torch.no_grad()
-def measure_perplexity(
-    optimum_model,
-    max_length: Optional[int] = None,
-    limit: Optional[Union[int, float]] = None,
-) -> float:
-    """
-    Measure perplexity on the Wikitext dataset, via rolling loglikelihoods for a given model.
-
-    :param optimum_model: A model to be evaluated.
-    :param max_length: The maximum sequence length for evaluation.
-    :param limit: Limit the number of examples per task (only use this for testing).
-        If <1, limit is a percentage of the total number of examples.
-    :return: The similarity score as a float.
-    """
-    task = "wikitext"
-    print("#" * 50 + " Evaluate via lm-eval-harness " + "#" * 50)
-    lm_obj = OptimumLM(pretrained=optimum_model, max_length=max_length)
-    results = simple_evaluate(lm_obj, tasks=[task], limit=limit, log_samples=False)
-    return results["results"][task]["word_perplexity,none"]
-
 
 @torch.no_grad()
 def calc_hiddens(model: nn.Module, dataloader: list[Tensor]) -> list[Tensor]:
@@ -215,7 +192,7 @@ def calc_hiddens(model: nn.Module, dataloader: list[Tensor]) -> list[Tensor]:
     :return: A list of hidden states for each input in the dataloader.
     """
     orig_hiddens = []
-    for data in track(dataloader, description="Calculating original hiddens"):
+    for data in tqdm(dataloader, desc="Calculating original hiddens"):
         model_input = get_model_input(data)
         orig_hiddens.append(model.model(**model_input).last_hidden_state)
 
@@ -285,7 +262,7 @@ def get_argument_parser() -> argparse.ArgumentParser:
         help="Whether to start from previously saved checkpoint. If not specified or checkpoint does not exist, "
         "start from scratch by post-training weight compression initialization.",
     )
-    parser.add_argument("--lora_rank", type=int, default=256, help="Rank of lora adapters")
+    parser.add_argument("--lora_rank", type=int, default=32, help="Rank of lora adapters")
     parser.add_argument(
         "--basic_init",
         action="store_true",
@@ -403,13 +380,9 @@ def main(argv) -> float:
     tb = SummaryWriter(tensorboard_dir, "QAT with absorbable LoRA")
 
     # Load original model and tokenizer.
-    model = AutoModelForCausalLM.from_pretrained(args.pretrained, torch_dtype=torch_dtype, device_map="auto", use_cache=False)
+    model = AutoModelForCausalLM.from_pretrained(args.pretrained, torch_dtype=torch_dtype, device_map="auto")
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained)
 
-    # Prepare training and calibration data
-    # train_loader = get_wikitext2(
-    #     num_samples=args.num_train_samples, seqlen=args.train_seqlen, tokenizer=tokenizer, device=device
-    # )
     train_loader = get_pile(
         num_samples=args.num_train_samples, seqlen=args.train_seqlen, tokenizer=tokenizer, device=device
     )
@@ -566,20 +539,10 @@ def main(argv) -> float:
         opt.zero_grad()
         if epoch > 0:
             save_codebook_layers(model, last_dir, epoch=epoch - 1)
-        # if epoch == 2:
-        #     del opt
-        #     torch.cuda.empty_cache()
-        #     opt = torch.optim.SGD([
-        #             {"params": codebook_params, "lr": args.lr},
-        #             {"params": scales_params, "lr": args.lr},
-        #             {"params": lora_params, "lr": args.lr},
-        #         ],
-        #         momentum=0.9)
-        #     scheduler.optimizer = opt
 
         batch_indices_epoch = torch.randperm(num_samples)[:epoch_samples].chunk(microbatches_per_epoch)
 
-        for indices in track(batch_indices_epoch, description=f"Train epoch {epoch} [{epoch_tag}] {loss_numerator / grad_steps if grad_steps > 0 else -1.0}"):
+        for indices in tqdm(batch_indices_epoch, desc=f"Train epoch {epoch} [{epoch_tag}] {loss_numerator / grad_steps if grad_steps > 0 else -1.0}"):
             indices = indices.tolist()
 
             def form_batch(inputs: list[Tensor], model_input: bool):
