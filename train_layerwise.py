@@ -211,26 +211,6 @@ class CodebookLoRASTELinear(nn.Module):
             return (self.lora_B @ self.lora_A) * (self.lora_alpha / self.lora_rank) + self.lora_c + self.lora_r
 
 
-    # def _get_effective_weight(self):
-    #     """Return ``orig_weight + lora_delta`` (2-D, on codebook device).
-
-    #     If LoRA parameters have not been created yet (during __init__),
-    #     returns just the original weight.
-    #     """
-
-    #     if not (hasattr(self, "lora_B") or hasattr(self, "lora")):
-    #         return self.orig_layer.weight.data.detach()
-
-    #     lora = self.get_lora()
-    #     if self.use_exp_for_lora:
-    #         # Clamp to prevent overflow (exp(10) ~ 22026 in bf16 range)
-    #         exponent = lora.clamp(-10.0, 10.0)
-    #         return self.orig_layer.weight.data.to(self.codebook.device) / torch.exp(exponent)
-    #     else:
-    #         return self.orig_layer.weight.data.to(self.codebook.device) + lora
-
-
-
     def dequantize_by_distance(self, codebook, normalized, return_indexes = False, noise=None):
         # stochasticity for better exploration of codebook assignments during training
         thresholds = (codebook[:-1] + codebook[1:]) / 2

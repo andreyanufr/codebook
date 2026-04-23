@@ -232,12 +232,17 @@ def kl_div(student_hiddens: torch.Tensor, teacher_hiddens: torch.Tensor) -> torc
     )
 
 
-def limit_type(astr: str):
-    value = float(astr)
-    if value < 0 or value > 1:
-        msg = "value not in range [0,1]"
-        raise argparse.ArgumentTypeError(msg)
-    return value
+class JSD(nn.Module):
+    def __init__(self):
+        super(JSD, self).__init__()
+        self.kl = nn.KLDivLoss(reduction='batchmean', log_target=True)
+
+    def forward(self, p: torch.tensor, q: torch.tensor):
+        p, q = p.view(-1, p.size(-1)), q.view(-1, q.size(-1))
+        p = F.softmax(p, dim=-1)
+        q = F.softmax(q, dim=-1)
+        m = (0.5 * (p + q)).log()
+        return 0.5 * (self.kl(m, p.log()) + self.kl(m, q.log()))
 
 
 def get_argument_parser() -> argparse.ArgumentParser:
@@ -263,26 +268,10 @@ def get_argument_parser() -> argparse.ArgumentParser:
         "start from scratch by post-training weight compression initialization.",
     )
     parser.add_argument("--lora_rank", type=int, default=32, help="Rank of lora adapters")
-    parser.add_argument(
-        "--basic_init",
-        action="store_true",
-        help="Whether to initialize quantization with basic min-max round-to-nearest schema. By default, advanced "
-        "data-aware post-training methods are used: AWQ + Scale Estimation. These methods typically provide better "
-        "accuracy, but require a calibration dataset and additional initialization time "
-        "(~20 sec for 1B and ~80 sec for 8B models).",
-    )
 
     # Data params
     parser.add_argument("--num_train_samples", type=int, default=1024, help="Number of training samples")
     parser.add_argument("--train_seqlen", type=int, default=1024, help="Train data context length.")
-    parser.add_argument("--eval_seqlen", type=int, default=2048, help="Evaluation data context length.")
-    parser.add_argument(
-        "--limit",
-        type=limit_type,
-        default=None,
-        help="A percentage of the total number of examples for evaluation. "
-        "Should be on the range [0,1]. If None, all samples will be used.",
-    )
 
     # Training params
     parser.add_argument(
@@ -292,7 +281,7 @@ def get_argument_parser() -> argparse.ArgumentParser:
         help="Learning rate for fine-tuning. "
         "For larger models (over 3 billion parameters), a learning rate of 5e-5 is recommended.",
     )
-    parser.add_argument("--epochs", type=int, default=50, help="Number of epochs.") #default=10
+    parser.add_argument("--epochs", type=int, default=10, help="Number of epochs.")
     parser.add_argument("--warmup_epochs", type=int, default=0, help="Number of warmup epochs for learning rate scheduler.")
     parser.add_argument("--batch_size", type=int, default=64, help="Size of training batch.")
     parser.add_argument(
@@ -380,7 +369,7 @@ def main(argv) -> float:
     tb = SummaryWriter(tensorboard_dir, "QAT with absorbable LoRA")
 
     # Load original model and tokenizer.
-    model = AutoModelForCausalLM.from_pretrained(args.pretrained, torch_dtype=torch_dtype, device_map="auto")
+    model = AutoModelForCausalLM.from_pretrained(args.pretrained, torch_dtype=torch_dtype, device_map="auto", use_cache=False)
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained)
 
     train_loader = get_pile(
@@ -533,6 +522,7 @@ def main(argv) -> float:
     model = torch.compile(model)
     n_updates = 0
     min_loss = float("inf")
+    jsd_loss = JSD()
 
     for epoch in range(args.epochs):
         loss_numerator = grad_steps = 0
@@ -560,7 +550,9 @@ def main(argv) -> float:
                         targets = torch.tanh(targets)
                         targets = targets * fls
             outputs = model(**inputs).logits
+
             loss = kl_div(outputs, targets.to(dtype=torch_dtype, device=device))
+            #loss = jsd_loss(outputs, targets.to(dtype=torch_dtype, device=device))
 
             # Perform an optimization step after accumulating gradients over multiple minibatches.
             if not torch.isfinite(loss).item():

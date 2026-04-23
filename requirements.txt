@@ -1,0 +1,6 @@
+torch==2.8.0+cu128
+transformers==4.57.0
+datasets==4.8.4
+tensorboard==2.20.0
+scipy==1.15.3
+accelerate==1.13.0
